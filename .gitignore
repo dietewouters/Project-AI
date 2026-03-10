@@ -205,3 +205,37 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# ========================
+# Project AI additions
+# ========================
+
+# Data (too large for git)
+data/raw/
+data/processed/
+data/groupadditivity_h298/
+
+# Trained models
+models/
+*.pt
+*.pth
+*.pkl
+*.joblib
+
+# Logs
+logs/
+*.log
+
+# Temporary experiment outputs
+outputs/
+
+# MacOS junk
+.DS_Store
+__MACOSX/
+
+# VSCode
+.vscode/
+
+# Python virtual environments
+conda-env/
