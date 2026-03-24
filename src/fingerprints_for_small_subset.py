@@ -37,7 +37,10 @@ def convert_csv_to_fingerprint_csv(input_path: str, output_path: str) -> None:
     out_df.to_csv(output_path, index=False)
     print(f"New csv file saved: {output_path}")
     
-input_file = "data/groupadditivity_h298/dataset/groupadditivity_0.004.csv"
-output_file = "data/groupadditivity_h298/dataset/fingerprints/groupadditivity_0.004_fingerprints.csv"
+#input_file = "data/groupadditivity_h298/dataset/groupadditivity_0.004.csv"
+#output_file = "data/groupadditivity_h298/dataset/fingerprints/groupadditivity_0.004_fingerprints.csv"
+
+input_file = "data/groupadditivity_h298/dataset/noise0.4/groupadditivity_0.004_noise0.4.csv"
+output_file = "data/groupadditivity_h298/dataset/fingerprints/noise0.4/groupadditivity_0.004_noise0.4_fingerprints.csv"
 
 convert_csv_to_fingerprint_csv(input_file, output_file)
