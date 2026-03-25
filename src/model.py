@@ -3,13 +3,14 @@
 
 import torch
 import torch.nn as nn
+from config import config
 
 class MLP(nn.Module):
     def __init__(
         self,
-        input_dim: int = 2049,       # 2048 fingerprint bits + 1 noisy value
-        hidden_dims: list = [1024, 512, 256],
-        dropout: float = 0.2,
+        input_dim: int = config["input_dim"],       # 2048 fingerprint bits + 1 noisy value
+        hidden_dims: list = config["hidden_dims"],
+        dropout: float = config["dropout"],
     ):
         super().__init__()
 
@@ -26,5 +27,8 @@ class MLP(nn.Module):
 
         self.network = nn.Sequential(*layers)
 
+        print(self.network)
+
     def forward(self, x):
         return self.network(x).squeeze(1)  # shape (batch_size,)
+

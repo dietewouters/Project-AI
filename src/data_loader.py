@@ -5,9 +5,12 @@ import pandas as pd
 import numpy as np
 #from sklearn.preprocessing import StandardScaler
 import torch
-from torch.utils.data import Dataset, DataLoader
+from config import config
+from torch.utils.data import Dataset, DataLoader, random_split
 ###### THIS DATALOADER ONLY WORKS ON A SPECIFIC FRACTION OF THE DATA!! ##########
  ###### HAS TO BE UPDATED TO WORK ON THE ENTIRE DATASET!!!!! #####################
+
+# K-NN ADDED -------!!!!!!!!!!!!!!!!!
 
 class MoleculeDataset(Dataset):
     def __init__(self, target_path: str, noisy_path: str, indices_path: str = None, scaler = None):
@@ -42,36 +45,20 @@ class MoleculeDataset(Dataset):
 def get_dataloaders(
         dataset_path: str,
         noisy_path: str,
-        indices_dir: str,
-        batch_size: int = 64,
-        num_workers: int = 0,
+        indices_dir: str
 ):
-    train_ds = MoleculeDataset(dataset_path, noisy_path)
-    val_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_secondarytest.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_secondarytest_noise0.01.csv')
-    test_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_test.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_test_noise0.01.csv')
+    dataset = MoleculeDataset(dataset_path, noisy_path)
+    #val_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_secondarytest.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_secondarytest_noise0.01.csv')
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    #test_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_test.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_test_noise0.01.csv')
     return {
-        "train": DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-        "val": DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers),
-        "test": DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers),
+        "train": DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=config["num_workers"]),
+        "val": DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=config["num_workers"]),
+        #"test": DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False, num_workers=config["num_workers"]),
     }
 
-def main():
-    FRACTION = 0.004
-    NOISE = 0.01
-    print(os.getcwd())
-    DATA_DIR = os.path.join(os.getcwd(), 'data', 'groupadditivity_h298')
-    INDICES_DIR = os.path.join(DATA_DIR, 'indices')
-    DATASET_DIR = os.path.join(DATA_DIR, 'dataset')
-
-    NOISE_DIR = os.path.join(DATASET_DIR, f'noise{NOISE}')
-
-    TARGET_FILE = os.path.join(DATASET_DIR, f'groupadditivity_{FRACTION}.csv')
-    TRAIN_FILE = os.path.join(NOISE_DIR, f'groupadditivity_{FRACTION}_noise{NOISE}.csv')
-    INDICES_FILE = os.path.join(INDICES_DIR, f'indices_{FRACTION}.csv')
-    dataset = MoleculeDataset(TARGET_FILE, TRAIN_FILE)
-
-if __name__ == '__main__':
-    main()
 
 
 

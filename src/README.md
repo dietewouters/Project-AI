@@ -34,3 +34,9 @@ In practice this is computed via **k-nearest neighbours in fingerprint space** (
 | `noisy` | 1 | Noisy ΔHf — corrupted version of the target |
 | `neighbour` *(future)* | 1 | ΔHf of the most similar known molecule |
 | **Total** | **2049 → 2050** | Concatenated input to the MLP |
+
+## To add 
+- [ ] k-nn 
+- [ ] use embedding of sparse vector 
+- [ ] explore state of art 
+- 
