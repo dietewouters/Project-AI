@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from model import MLP
+from evaluate import evaluate
 from data_loader import get_dataloaders
 
 def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
@@ -19,19 +20,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
         optimizer.step()
 
         total_loss += loss.item() * len(y)
-    return total_loss / len(loader.dataset)
-
-def evaluate(model, loader, criterion, device) -> float:
-    model.eval()
-    total_loss = 0.0
-
-    with torch.no_grad():
-        for X, y in loader:
-            X, y = X.to(device), y.to(device)
-            predictions = model(X)
-            loss = criterion(predictions, y)
-            total_loss += loss.item() * len(y)
-
     return total_loss / len(loader.dataset)
 
 def train(model, loaders, config, device, optimizer = None, criterion = None) -> tuple[MLP, dict]:
@@ -74,10 +62,3 @@ def train(model, loaders, config, device, optimizer = None, criterion = None) ->
     # ---- Restore best model ----
     model.load_state_dict(best_model_state)
     return model, history
-
-
-
-def test(model, loader, criterion, device) -> float:
-    total_loss = evaluate(model, loader['test'], criterion, device)
-    print(f"Test Loss: {total_loss:.4f}")
-    return total_loss / len(loader.dataset)
