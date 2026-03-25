@@ -1,0 +1,6 @@
+- [ ] Research SOTA for MLP architecture
+- [ ] Test on small dataset 
+- [ ] Test on dataset using indices 
+- [ ] Test in log-space 
+- [ ] Research methods to deal with sparse vectors
+- [ ] Test NN methods 
