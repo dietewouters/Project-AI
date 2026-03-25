@@ -4,3 +4,4 @@
 - [ ] Test in log-space 
 - [ ] Research methods to deal with sparse vectors
 - [ ] Test NN methods 
+- [ ] Thinking about data leakage
