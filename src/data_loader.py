@@ -39,6 +39,22 @@ class MoleculeDataset(Dataset):
         x = torch.cat([self.fp[idx], self.noisy[idx]], dim=0)  # (2049,) for now
         return x, self.y[idx]
 
+def get_dataloaders(
+        dataset_path: str,
+        noisy_path: str,
+        indices_dir: str,
+        batch_size: int = 64,
+        num_workers: int = 0,
+):
+    train_ds = MoleculeDataset(dataset_path, noisy_path)
+    val_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_secondarytest.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_secondarytest_noise0.01.csv')
+    test_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_test.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_test_noise0.01.csv')
+    return {
+        "train": DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers),
+        "val": DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers),
+        "test": DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers),
+    }
+
 def main():
     FRACTION = 0.004
     NOISE = 0.01
