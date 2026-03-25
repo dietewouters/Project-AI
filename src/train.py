@@ -1,7 +1,6 @@
 # Training loop + validation
 import torch
 import torch.nn as nn
-from alembic.command import history
 
 from model import MLP
 from data_loader import get_dataloaders
@@ -78,5 +77,7 @@ def train(model, loaders, config, device, optimizer = None, criterion = None) ->
 
 
 
-def test(model, loaders, criterion, device) -> float:
-    pass
+def test(model, loader, criterion, device) -> float:
+    total_loss = evaluate(model, loader['test'], criterion, device)
+    print(f"Test Loss: {total_loss:.4f}")
+    return total_loss / len(loader.dataset)
