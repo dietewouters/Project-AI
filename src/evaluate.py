@@ -17,4 +17,4 @@ def evaluate(model, loader, criterion, device) -> float:
 def test(model, loader, criterion, device) -> float:
     total_loss = evaluate(model, loader['test'], criterion, device)
     print(f"Test Loss: {total_loss:.4f}")
-    return total_loss / len(loader.dataset)
+    return total_loss

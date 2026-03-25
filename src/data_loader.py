@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from config import config
 from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.preprocessing import StandardScaler
 ###### THIS DATALOADER ONLY WORKS ON A SPECIFIC FRACTION OF THE DATA!! ##########
  ###### HAS TO BE UPDATED TO WORK ON THE ENTIRE DATASET!!!!! #####################
 
@@ -47,7 +48,8 @@ def get_dataloaders(
         noisy_path: str,
         indices_dir: str
 ):
-    dataset = MoleculeDataset(dataset_path, noisy_path)
+    scaler = StandardScaler()
+    dataset = MoleculeDataset(dataset_path, noisy_path, scaler=scaler)
     #val_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_secondarytest.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_secondarytest_noise0.01.csv')
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
