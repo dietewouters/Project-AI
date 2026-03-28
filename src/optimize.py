@@ -4,10 +4,64 @@ import copy
 import optuna
 import pandas as pd
 from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+from optuna.importance import get_param_importances
 
 from model import MLP
 from train import train
 
+def plot_optimization_results(study: optuna.Study) -> None:
+    completed_trials = [
+        trial for trial in study.trials
+        if trial.value is not None and trial.state == optuna.trial.TrialState.COMPLETE
+    ]
+
+    if not completed_trials:
+        print("No completed trials to plot.")
+        return
+
+    trial_numbers = [trial.number for trial in completed_trials]
+    values = [trial.value for trial in completed_trials]
+
+    best_so_far = []
+    current_best = float("inf")
+    for v in values:
+        current_best = min(current_best, v)
+        best_so_far.append(current_best)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(trial_numbers, values, marker="o", label="Trial validation loss")
+    plt.plot(trial_numbers, best_so_far, linewidth=2, label="Best so far")
+    plt.xlabel("Trial")
+    plt.ylabel("Validation Loss")
+    plt.title("Optuna Optimization History")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# Deze werkte nog ni
+# def plot_param_importance(study: optuna.Study) -> None:
+#     try:
+#         importances = get_param_importances(study)
+
+#         if not importances:
+#             print("No parameter importances available.")
+#             return
+
+#         names = list(importances.keys())
+#         values = list(importances.values())
+
+#         plt.figure(figsize=(8, 5))
+#         plt.barh(names, values)
+#         plt.xlabel("Importance")
+#         plt.ylabel("Hyperparameter")
+#         plt.title("Hyperparameter Importance")
+#         plt.tight_layout()
+#         plt.show()
+
+#     except Exception as e:
+#         print(f"Could not plot parameter importances: {e}")
 
 def create_optuna_objective(base_config, train_dataset, val_dataset, device):
     def objective(trial):
@@ -71,6 +125,8 @@ def run_optimization(base_config, train_dataset, val_dataset, device, n_trials: 
 
     # ---- Log and return best config ----
     log_results(study)
+    plot_optimization_results(study)
+    #plot_param_importance(study)
 
     best_config = copy.deepcopy(base_config)
     best_config.update(study.best_trial.params)
