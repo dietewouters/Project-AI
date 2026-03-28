@@ -2,10 +2,9 @@
 - [x] Finish basic version of `optimize.py`
 - [x] Generate visual results for optimisation process
 - [ ] Improvements on `optimize.py`
+- [ ] Real test on a independent test set
 
-```
-[ x ] Test on small dataset
-```
+  - [ ] Test on small dataset
 
 - [ ] Test on dataset using indices
 - [ ] Test in log-space
