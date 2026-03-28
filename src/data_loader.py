@@ -26,8 +26,8 @@ class MoleculeDataset(Dataset):
 
         # ---- Optional scaling ----
         if scaler is not None:
-            df["input"] = scaler.transform(df[["input"]]).squeeze()
-            df["target"] = scaler.transform(df[["target"]]).squeeze()
+            df["input"] = scaler.fit_transform(df[["input"]].values).squeeze()
+            df["target"] = scaler.transform(df[["target"]].values).squeeze()
 
         fp_matrix = np.vstack(df["fingerprint"].apply(lambda x: np.array(list(x), dtype=np.uint8)))
 
