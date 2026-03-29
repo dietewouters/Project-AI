@@ -1,106 +1,147 @@
 #!/usr/bin/env python3
 """
-MolAugment CLI — Interactive dataset augmentation toolkit.
+User Interface CLI v3 -- Pipeline-driven dataset synthesis & GNN training toolkit.
 
-A sleek terminal UI for scanning, inspecting, and augmenting molecular
-property datasets (SMILES + target CSV files).
+All navigation uses arrow keys + ENTER. No number input, no emoji.
 
 Run:
-    python src/cli.py                     # auto-scan from project root
-    python src/cli.py --root ./datasets   # scan a specific directory
+    python src/cli.py
 """
 
 from __future__ import annotations
 
+import copy
+import curses
+import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
-# Ensure sibling modules (augment_dataset.py) are importable
+import numpy as np
+import pandas as pd
+
+# -- ensure sibling modules are importable ------------------------------------
 _SRC_DIR = str(Path(__file__).resolve().parent)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-# ---------------------------------------------------------------------------
-# Dependency bootstrap — install rich automatically if missing
-# ---------------------------------------------------------------------------
-try:
-    import rich
-except ImportError:
-    print("Installing 'rich' for terminal UI …")
+# -- dependency bootstrap -----------------------------------------------------
+def _pip_install(pkg: str):
     import subprocess as _sp
-    _sp.check_call([sys.executable, "-m", "pip", "install", "rich", "-q"])
-    import rich  # noqa: F811 — re-import after install
+    _sp.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
 
-import pandas as pd
+for _pkg in ("rich", "pandas", "scipy"):
+    try:
+        __import__(_pkg)
+    except ImportError:
+        print(f"Installing '{_pkg}' ...")
+        _pip_install(_pkg)
+
 from rich import box
-from rich.align import Align
-from rich.columns import Columns
 from rich.console import Console
-from rich.markup import escape
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
+    BarColumn, MofNCompleteColumn, Progress,
+    SpinnerColumn, TextColumn, TimeElapsedColumn,
 )
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import Confirm, IntPrompt, Prompt, FloatPrompt
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-# ---------------------------------------------------------------------------
-# Theme & console
-# ---------------------------------------------------------------------------
-CUSTOM_THEME = Theme({
-    "brand":    "bold cyan",
-    "accent":   "bold magenta",
-    "success":  "bold green",
-    "warn":     "bold yellow",
-    "err":      "bold red",
-    "muted":    "dim white",
-    "heading":  "bold white on rgb(30,30,60)",
+# =============================================================================
+#  Theme & console
+# =============================================================================
+THEME = Theme({
+    "brand":   "bold cyan",
+    "accent":  "bold magenta",
+    "success": "bold green",
+    "warn":    "bold yellow",
+    "err":     "bold red",
+    "muted":   "dim white",
+    "hi":      "bold white",
 })
+console = Console(theme=THEME)
 
-console = Console(theme=CUSTOM_THEME)
+VERSION = "3.0.0"
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-BRAND = "[brand]⚗  MolAugment[/brand]"
-VERSION = "1.0.0"
+# =============================================================================
+#  Workspace paths
+# =============================================================================
+WORKSPACE  = Path(__file__).resolve().parent / "cli_workspace"
+STATE_FILE = WORKSPACE / ".state.json"
+SPLIT_NAMES = ("train", "test", "val")
+
+# =============================================================================
+#  Default state
+# =============================================================================
+DEFAULT_STATE: dict[str, Any] = {
+    "pipelines": {
+        "train": {"base_file": None, "slices": [], "augment": False},
+        "test":  {"base_file": None, "slices": [], "augment": False},
+        "val":   {"base_file": None, "slices": [], "augment": False},
+    },
+    "prepared": {"train": None, "test": None, "val": None},
+    "config": {
+        "smiles_col":    "smiles",
+        "target_col":    "h298",
+        "epochs":        30,
+        "batch_size":    128,
+        "seed":          42,
+        "max_tautomers": 5,
+        "do_mirror":     True,
+        "do_tautomers":  True,
+        "attributes":    ["h298"],
+    },
+    "models": {},
+}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  UI helpers
-# ═══════════════════════════════════════════════════════════════════════════
+def load_state() -> dict:
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                st = json.load(f)
+            for k, v in DEFAULT_STATE.items():
+                if k not in st:
+                    st[k] = copy.deepcopy(v)
+                elif isinstance(v, dict):
+                    for kk, vv in v.items():
+                        if kk not in st[k]:
+                            st[k][kk] = copy.deepcopy(vv)
+            return st
+        except Exception:
+            pass
+    return copy.deepcopy(DEFAULT_STATE)
+
+
+def save_state(state: dict):
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+# =============================================================================
+#  Rich UI helpers
+# =============================================================================
 
 def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
 
 def banner():
-    """Print the app banner."""
     art = Text.from_markup(
-        "\n"
-        "  [brand]⚗  MolAugment[/brand]  [muted]v" + VERSION + "[/muted]\n"
-        "  [muted]Interactive molecular dataset augmentation toolkit[/muted]\n"
+        f"\n  [brand]MolAugment[/brand]  [muted]v{VERSION}[/muted]\n"
+        "  [muted]Data synthesis, noise generation & GNN training pipeline[/muted]\n"
     )
-    console.print(
-        Panel(
-            art,
-            border_style="cyan",
-            box=box.DOUBLE_EDGE,
-            expand=False,
-            padding=(0, 2),
-        )
-    )
+    console.print(Panel(art, border_style="cyan", box=box.DOUBLE_EDGE,
+                        expand=False, padding=(0, 2)))
 
 
 def section(title: str):
@@ -109,24 +150,10 @@ def section(title: str):
     console.print()
 
 
-def success(msg: str):
-    console.print(f"  [success]✓[/success] {msg}")
-
-
-def warn(msg: str):
-    console.print(f"  [warn]⚠[/warn]  {msg}")
-
-
-def error(msg: str):
-    console.print(f"  [err]✗[/err] {msg}")
-
-
-def humanize_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if abs(n) < 1024:
-            return f"{n:,.0f} {unit}"
-        n /= 1024  # type: ignore[assignment]
-    return f"{n:,.1f} TB"
+def success(msg: str):  console.print(f"  [success]OK[/success]  {msg}")
+def warn(msg: str):     console.print(f"  [warn]!![/warn]  {msg}")
+def error(msg: str):    console.print(f"  [err]ERR[/err] {msg}")
+def info(msg: str):     console.print(f"  [muted]--[/muted]  {msg}")
 
 
 def pause():
@@ -134,511 +161,688 @@ def pause():
     Prompt.ask("  [muted]Press Enter to continue[/muted]", default="")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CSV scanning & inspection
-# ═══════════════════════════════════════════════════════════════════════════
-
-def scan_csvs(root: Path, max_depth: int = 6) -> list[Path]:
-    """Recursively discover CSV files, skipping hidden dirs & venvs."""
-    skip = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox"}
-    found: list[Path] = []
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        # prune
-        depth = str(dirpath).count(os.sep) - str(root).count(os.sep)
-        if depth >= max_depth:
-            dirnames.clear()
-            continue
-        dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith('.')]
-        for f in sorted(filenames):
-            if f.lower().endswith(".csv"):
-                found.append(Path(dirpath) / f)
-    return found
+def humanize_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:,.0f} {unit}"
+        n /= 1024  # type: ignore
+    return f"{n:,.1f} TB"
 
 
-def peek_csv(path: Path, n: int = 5) -> tuple[int, list[str], pd.DataFrame]:
-    """Return (row_count, columns, head_df) for a CSV."""
-    df = pd.read_csv(path, nrows=0)
-    cols = list(df.columns)
-    # count rows cheaply
-    with open(path, "rb") as f:
-        row_count = sum(1 for _ in f) - 1          # minus header
-    head_df = pd.read_csv(path, nrows=n)
-    return row_count, cols, head_df
+# =============================================================================
+#  Curses helpers
+# =============================================================================
+
+def curses_select(items: list[str], title: str = "", subtitle: str = "") -> int:
+    result = [-1]
+
+    def _run(stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN,   -1)   # selected row
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)   # title
+        curses.init_pair(3, curses.COLOR_GREEN,  -1)   # hint
+
+        cursor = 0
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            if title:
+                try:
+                    stdscr.addstr(0, 0, f"  {title}  "[:w - 1].ljust(w - 1)[:w - 1],
+                                  curses.color_pair(2) | curses.A_BOLD)
+                except curses.error:
+                    pass
+
+            row = 1
+            if subtitle:
+                try:
+                    stdscr.addstr(row, 0, f"  {subtitle}"[:w - 1], curses.A_DIM)
+                    row += 1
+                except curses.error:
+                    pass
+
+            try:
+                stdscr.hline(row, 0, curses.ACS_HLINE, w - 1)
+                row += 1
+            except curses.error:
+                pass
+
+            max_rows = max(1, h - row - 2)
+            scroll_off = max(0, cursor - max_rows + 1)
+            visible = items[scroll_off: scroll_off + max_rows]
+
+            for i, label in enumerate(visible):
+                real_i  = i + scroll_off
+                is_cur  = real_i == cursor
+                prefix  = " -> " if is_cur else "    "
+                line    = f"{prefix}{label}"
+                line    = line[:w - 1].ljust(w - 1)[:w - 1]
+                attr    = (curses.color_pair(1) | curses.A_BOLD) if is_cur else curses.A_NORMAL
+                try:
+                    stdscr.addstr(row + i, 0, line, attr)
+                except curses.error:
+                    pass
+
+            hint = "  UP/DOWN  navigate    ENTER  select    ESC/Q  cancel"
+            try:
+                stdscr.addstr(h - 1, 0, hint[:w - 1].ljust(w - 1)[:w - 1], curses.color_pair(3))
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if key in (curses.KEY_UP, ord('k')):
+                cursor = max(0, cursor - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                cursor = min(len(items) - 1, cursor + 1)
+            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                result[0] = cursor
+                break
+            elif key in (27, ord('q'), ord('Q')):
+                result[0] = -1
+                break
+
+    curses.wrapper(_run)
+    return result[0]
 
 
-def display_csv_table(csvs: list[Path], root: Path) -> Table:
-    """Build a rich Table listing discovered CSVs."""
-    table = Table(
-        box=box.ROUNDED,
-        border_style="cyan",
-        header_style="bold white on rgb(30,30,60)",
-        row_styles=["", "on rgb(20,20,35)"],
-        show_lines=False,
-        pad_edge=True,
-        expand=True,
-    )
-    table.add_column("#", style="brand", justify="right", width=4)
-    table.add_column("File", style="white", ratio=4)
-    table.add_column("Size", style="muted", justify="right", width=10)
-    table.add_column("Rows", style="muted", justify="right", width=10)
-    table.add_column("Columns", style="cyan", ratio=3)
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", "cli_workspace"}
 
-    for i, csv_path in enumerate(csvs, 1):
-        rel = csv_path.relative_to(root)
-        size = csv_path.stat().st_size
-        try:
-            row_count, cols, _ = peek_csv(csv_path)
-            cols_str = ", ".join(cols[:5])
-            if len(cols) > 5:
-                cols_str += f" [muted](+{len(cols)-5})[/muted]"
-        except Exception:
-            row_count = -1
-            cols_str = "[err]error reading[/err]"
-        table.add_row(
-            str(i),
-            str(rel),
-            humanize_bytes(size),
-            f"{row_count:,}" if row_count >= 0 else "?",
-            cols_str,
-        )
-    return table
-
-
-def inspect_csv(csv_path: Path):
-    """Show detailed info + head of a CSV."""
-    section(f"Inspecting: {csv_path.name}")
+def _list_dir_entries(path: Path) -> list[tuple[str, bool]]:
+    entries = []
     try:
-        row_count, cols, head_df = peek_csv(csv_path, n=8)
-    except Exception as e:
-        error(f"Could not read file: {e}")
-        return
-
-    info_items = [
-        f"[brand]Path:[/brand]    {csv_path}",
-        f"[brand]Size:[/brand]    {humanize_bytes(csv_path.stat().st_size)}",
-        f"[brand]Rows:[/brand]    {row_count:,}",
-        f"[brand]Columns:[/brand] {', '.join(cols)}",
-    ]
-    console.print(Panel(
-        "\n".join(info_items),
-        title="[accent]File info[/accent]",
-        border_style="magenta",
-        expand=False,
-        padding=(1, 3),
-    ))
-
-    # preview table
-    preview = Table(
-        box=box.SIMPLE_HEAD,
-        border_style="cyan",
-        header_style="bold cyan",
-        show_lines=False,
-    )
-    for col in head_df.columns:
-        preview.add_column(col, overflow="fold")
-    for _, row in head_df.iterrows():
-        preview.add_row(*[str(v) for v in row])
-
-    console.print(Padding(preview, (1, 2)))
+        for p in sorted(path.iterdir()):
+            if p.name.startswith(".") or p.name in _SKIP_DIRS:
+                continue
+            entries.append((p.name, p.is_dir()))
+    except PermissionError:
+        pass
+    entries.sort(key=lambda x: (not x[1], x[0].lower()))
+    return entries
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Column auto-detection
-# ═══════════════════════════════════════════════════════════════════════════
+def browse_and_select_single(start_path: Path) -> Path | None:
+    """Interactive curses file browser. Allows picking a SINGLE file."""
+    selected_path: list[str] = [None]
 
-_SMILES_HINTS = {"smiles", "smi", "smile", "canonical_smiles", "mol", "molecule", "input"}
-_TARGET_HINTS = {"h298", "target", "value", "property", "enthalpy", "energy", "y"}
+    def _run(stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+
+        nav_stack: list[Path] = []
+        current = start_path.resolve()
+        cursor = 0
+
+        while True:
+            entries = _list_dir_entries(current)
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            path_disp = str(current)
+            if len(path_disp) > w - 7:
+                path_disp = "..." + path_disp[-(w - 10):]
+            header = f" DIR: {path_disp}"
+            try:
+                stdscr.addstr(0, 0, header[:w - 1].ljust(w - 1)[:w - 1], curses.A_REVERSE)
+            except curses.error: pass
+
+            hint = " UP/DOWN select   ENTER open/confirm   BKSP go up   Q cancel"
+            try:
+                stdscr.addstr(1, 0, hint[:w - 1], curses.color_pair(3))
+                stdscr.hline(2, 0, curses.ACS_HLINE, w - 1)
+            except curses.error: pass
+
+            max_rows = max(1, h - 5)
+            scroll_off = max(0, cursor - max_rows + 3)
+            visible = entries[scroll_off: scroll_off + max_rows]
+
+            for i, (name, is_dir) in enumerate(visible):
+                real_i = i + scroll_off
+                is_cur = real_i == cursor
+                prefix = ">" if is_dir else " "
+                line = f" {prefix} {name}"
+                line = line[:w - 1].ljust(w - 1)[:w - 1]
+
+                if is_cur:
+                    attr = curses.A_REVERSE
+                elif is_dir:
+                    attr = curses.color_pair(2)
+                else:
+                    attr = curses.A_NORMAL
+
+                try:
+                    stdscr.addstr(3 + i, 0, line, attr)
+                except curses.error: pass
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if key in (curses.KEY_UP, ord('k')):
+                cursor = max(0, cursor - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                cursor = min(max(0, len(entries) - 1), cursor + 1)
+            elif key in (ord('q'), ord('Q'), 27):
+                break
+            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                if entries and 0 <= cursor < len(entries):
+                    name, is_dir = entries[cursor]
+                    if is_dir:
+                        nav_stack.append(current)
+                        current = current / name
+                        cursor = 0
+                    else:
+                        selected_path[0] = str(current / name)
+                        break
+            elif key in (curses.KEY_BACKSPACE, 127, curses.KEY_LEFT):
+                if nav_stack:
+                    current = nav_stack.pop()
+                    cursor = 0
+
+    curses.wrapper(_run)
+    return Path(selected_path[0]) if selected_path[0] else None
 
 
-def guess_columns(cols: list[str]) -> tuple[str | None, str | None]:
-    """Try to auto-detect the SMILES and target columns."""
-    smiles_col = None
-    target_col = None
-    lower_cols = {c.lower(): c for c in cols}
-    for hint in _SMILES_HINTS:
-        if hint in lower_cols:
-            smiles_col = lower_cols[hint]
+# =============================================================================
+#  Status / Overview
+# =============================================================================
+
+def print_status(state: dict):
+    section("Workspace Overview")
+    cfg = state["config"]
+
+    # Config Summary
+    cfg_tbl = Table(box=box.SIMPLE, show_header=False, expand=False, padding=(0, 1))
+    cfg_tbl.add_column("Key", style="accent", width=24)
+    cfg_tbl.add_column("Value", style="white")
+    cfg_tbl.add_row("SMILES column", cfg["smiles_col"])
+    cfg_tbl.add_row("Target column", cfg["target_col"])
+    cfg_tbl.add_row("Attributes", ", ".join(cfg["attributes"]))
+    console.print(Panel(cfg_tbl, title="[hi]Config[/hi]", border_style="cyan", expand=False))
+
+    # Pipeline status
+    for split in SPLIT_NAMES:
+        p_cfg = state["pipelines"][split]
+        prepared = state["prepared"][split]
+
+        tbl = Table(box=box.SIMPLE, show_header=False, expand=True, padding=(0, 1))
+        tbl.add_column("Param", style="white", width=14)
+        tbl.add_column("Value", style="muted")
+
+        tbl.add_row("Base CSV", p_cfg["base_file"] or "None")
+        if p_cfg["base_file"]:
+            slices_str = ", ".join(f"{s['fraction']*100}% at {s['noise']} noise" for s in p_cfg["slices"])
+            tbl.add_row("Slices", slices_str if slices_str else "100% at 0 noise")
+            tbl.add_row("Augment", "ON" if p_cfg["augment"] else "OFF")
+
+            if prepared and (WORKSPACE / prepared).exists():
+                sz = (WORKSPACE / prepared).stat().st_size
+                tbl.add_row("Prepared", f"[success]{prepared}[/success] ({humanize_bytes(sz)})")
+            else:
+                tbl.add_row("Prepared", "[warn]Not prepared yet[/warn]")
+
+        border = {"train": "magenta", "test": "blue", "val": "green"}[split]
+        console.print(Panel(tbl, title=f"[hi]{split.capitalize()} Pipeline[/hi]", border_style=border))
+
+
+# =============================================================================
+#  Pipeline Configuration Sub-menus
+# =============================================================================
+
+def menu_pipeline_split(state: dict, split: str):
+    p_cfg = state["pipelines"][split]
+    
+    while True:
+        clear()
+        banner()
+        section(f"Configure {split.capitalize()} Pipeline")
+        
+        base = p_cfg["base_file"] or "None"
+        s_count = len(p_cfg["slices"])
+        aug_st = "ON" if p_cfg["augment"] else "OFF"
+        
+        opts = [
+            f"Assign base CSV file  [{base}]",
+            f"Manage noise slices    [{s_count} slices configured]",
+            f"Toggle augmentation    [{aug_st}]",
+            "-- Back --"
+        ]
+        
+        idx = curses_select(opts, title=f"{split.capitalize()} Settings")
+        if idx < 0 or idx == 3:
             break
-    for hint in _TARGET_HINTS:
-        if hint in lower_cols:
-            target_col = lower_cols[hint]
+            
+        elif idx == 0:
+            proj_root = Path(__file__).resolve().parent.parent
+            console.print(f"\n  [muted]Opening browser in {proj_root}[/muted]")
+            pause()
+            selected = browse_and_select_single(proj_root)
+            if selected:
+                dest = WORKSPACE / selected.name
+                shutil.copy2(selected, dest)
+                p_cfg["base_file"] = dest.name
+                save_state(state)
+                success(f"Assigned base CSV: [brand]{dest.name}[/brand]")
+                pause()
+                
+        elif idx == 1:
+            menu_manage_slices(state, split)
+            
+        elif idx == 2:
+            p_cfg["augment"] = not p_cfg["augment"]
+            save_state(state)
+
+
+def menu_manage_slices(state: dict, split: str):
+    p_cfg = state["pipelines"][split]
+    
+    while True:
+        clear()
+        banner()
+        section(f"Manage Noise Slices ({split})")
+        
+        slices = p_cfg["slices"]
+        opts = []
+        tot_frac = 0.0
+        for i, s in enumerate(slices):
+            n_type = s.get("type", "normal")
+            opts.append(f"Remove Slice: {s['fraction']*100:.1f}% data | {n_type} noise, scale: {s['noise']}")
+            tot_frac += s["fraction"]
+            
+        opts.append(f"Add new slice (Remaining: {(1.0 - tot_frac)*100:.1f}%)")
+        opts.append("-- Done --")
+        
+        idx = curses_select(opts, title="Noise Configuration")
+        if idx < 0 or idx == len(opts) - 1:
             break
-    return smiles_col, target_col
+            
+        if idx < len(slices):
+            # Remove
+            slices.pop(idx)
+            save_state(state)
+        else:
+            # Add
+            rem = 1.0 - tot_frac
+            if rem <= 0:
+                warn("100% of data is already sliced! Remove a slice first.")
+                pause()
+                continue
+                
+            fraction = FloatPrompt.ask(f"  [accent]Fraction of data to use[/accent] (e.g. 0.1 for 10%, max {rem:.2f})")
+            if fraction <= 0 or fraction > rem:
+                warn(f"Invalid fraction. Must be between 0.01 and {rem:.2f}")
+                pause()
+                continue
+                
+            noise = FloatPrompt.ask("  [accent]Noise scale (std dev for normal distribution or base level)[/accent]")
+            
+            noise_type = "normal"
+            if noise > 0:
+                types = ["normal", "cosh", "uniform", "bimodal", "half_and_half", "nitrogen"]
+                t_idx = curses_select(types, title="Select Noise Distribution Type")
+                if t_idx >= 0:
+                    noise_type = types[t_idx]
+            
+            slices.append({"fraction": fraction, "noise": noise, "type": noise_type})
+            save_state(state)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Augmentation engine  (wraps augment_dataset.py functions)
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  Execution Pipeline (Prep)
+# =============================================================================
 
-def _ensure_rdkit():
+def _ensure_rdkit() -> bool:
     try:
         from rdkit import Chem  # noqa: F401
         return True
     except ImportError:
-        error("RDKit is not installed in this Python environment.")
-        warn("Install via:  [bold]conda install -c conda-forge rdkit[/bold]")
-        warn("Or:           [bold]pip install rdkit[/bold]")
+        error("RDKit is not installed.")
         return False
 
 
-def run_augmentation(
-    csv_path: Path,
-    smiles_col: str,
-    target_col: str,
-    do_mirror: bool,
-    do_tautomers: bool,
-    max_tautomers: int,
-    output_path: Path,
-):
-    """Run the augmentation pipeline with a live rich progress bar."""
-
-    if not _ensure_rdkit():
+def run_preparation_pipeline(state: dict):
+    section("Data Preparation Pipeline Execution")
+    
+    tasks = [sp for sp in SPLIT_NAMES if state["pipelines"][sp]["base_file"]]
+    if not tasks:
+        warn("No splits have a base file assigned. Configure the pipeline first.")
         return
-
-    # Late import so the CLI menu still works without rdkit
-    from augment_dataset import mirror_molecule, enumerate_tautomers
-
-    df = pd.read_csv(csv_path)
-    total = len(df)
-
-    rows: list[dict] = []
-    mirror_count = 0
-    tautomer_count = 0
-    invalid_count = 0
-
-    with Progress(
-        SpinnerColumn("dots", style="cyan"),
-        TextColumn("[brand]{task.description}[/brand]"),
-        BarColumn(bar_width=40, style="magenta", complete_style="cyan", finished_style="green"),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
-        task = progress.add_task("Augmenting molecules …", total=total)
-
-        for _, row in df.iterrows():
-            smi = row[smiles_col]
-            target = row[target_col]
-
-            rows.append({smiles_col: smi, target_col: target, "augmentation": "original"})
-
-            # mirror
-            if do_mirror:
-                try:
-                    mirror_smi = mirror_molecule(smi)
-                    if mirror_smi is not None:
-                        rows.append({
-                            smiles_col: mirror_smi,
-                            target_col: target,
-                            "augmentation": "mirror",
-                        })
-                        mirror_count += 1
-                except Exception:
-                    invalid_count += 1
-
-            # tautomers
-            if do_tautomers:
-                try:
-                    for taut_smi in enumerate_tautomers(smi, max_tautomers=max_tautomers):
-                        rows.append({
-                            smiles_col: taut_smi,
-                            target_col: target,
-                            "augmentation": "tautomer",
-                        })
-                        tautomer_count += 1
-                except Exception:
-                    invalid_count += 1
-
-            progress.advance(task)
-
-    aug_df = pd.DataFrame(rows)
-    aug_df.to_csv(output_path, index=False)
-
-    # ── result summary ──
-    section("Results")
-
-    ratio = len(aug_df) / total if total else 0
-
-    stats = Table(box=box.ROUNDED, border_style="green", expand=False, show_header=False)
-    stats.add_column("Metric", style="white", width=28)
-    stats.add_column("Value", style="brand", justify="right", width=14)
-
-    stats.add_row("Original rows", f"{total:,}")
-    stats.add_row("+ Mirror (enantiomers)", f"{mirror_count:,}")
-    stats.add_row("+ Tautomers", f"{tautomer_count:,}")
-    if invalid_count:
-        stats.add_row("[warn]Skipped (invalid SMILES)[/warn]", f"[warn]{invalid_count:,}[/warn]")
-    stats.add_row("", "")
-    stats.add_row("[success]Total rows[/success]", f"[success]{len(aug_df):,}[/success]")
-    stats.add_row("Expansion factor", f"{ratio:.2f}×")
-    stats.add_row("", "")
-    stats.add_row("Saved to", str(output_path))
-
-    console.print(Padding(stats, (0, 2)))
-    console.print()
-    success(f"Augmented dataset written to [bold]{output_path}[/bold]")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Interactive menu system
-# ═══════════════════════════════════════════════════════════════════════════
-
-def menu_select_csv(csvs: list[Path], root: Path) -> Path | None:
-    """Let the user pick a CSV — with search/filter support."""
-    active = csvs  # the currently displayed subset
-
-    while True:
-        section("Discovered CSV files")
-
-        if len(active) > 30:
-            console.print(
-                f"  [muted]{len(active)} files found — too many to list all.[/muted]\n"
-                f"  [muted]Type a search term to filter, or 'all' to show everything.[/muted]"
-            )
-            console.print()
-            query = Prompt.ask(
-                "  [accent]Search / filter[/accent] [muted](text, 'all', or 'q' to quit)[/muted]",
-                default="groupadditivity_0",
-            )
-            if query.lower() in ("q", "quit", "exit"):
-                return None
-            if query.lower() == "all":
-                filtered = active
-            else:
-                filtered = [p for p in active if query.lower() in str(p.relative_to(root)).lower()]
-            if not filtered:
-                warn(f"No files matching '{query}'. Try again.")
-                continue
-            active = filtered
-            continue  # re-display with the filtered list
-
-        console.print(display_csv_table(active, root))
-        console.print()
-
-        choice = Prompt.ask(
-            "  [accent]Select a file[/accent] [muted](number, 'f' to re-filter, or 'q' to quit)[/muted]",
-            default="1",
-        )
-        if choice.lower() in ("q", "quit", "exit"):
-            return None
-        if choice.lower() in ("f", "filter", "search"):
-            active = csvs  # reset to full list and re-filter
+        
+    for split in tasks:
+        p_cfg = state["pipelines"][split]
+        c_cfg = state["config"]
+        base_path = WORKSPACE / p_cfg["base_file"]
+        
+        if not base_path.exists():
+            error(f"Base file {p_cfg['base_file']} for {split} does not exist.")
             continue
+            
+        info(f"Processing split: {split}")
+        
+        # 1. Load and slice/noise
+        df = pd.read_csv(base_path)
+        if c_cfg["smiles_col"] not in df.columns or c_cfg["target_col"] not in df.columns:
+            error(f"Columns {c_cfg['smiles_col']} or {c_cfg['target_col']} missing in {base_path.name}")
+            continue
+            
+        # Shuffle completely before slicing
+        df = df.sample(frac=1, random_state=c_cfg["seed"]).reset_index(drop=True)
+        
+        slices = p_cfg["slices"]
+        if not slices:
+            slices = [{"fraction": 1.0, "noise": 0.0}]
+            
+        slice_dfs = []
+        current_idx = 0
+        total_len = len(df)
+        
+        for idx, s in enumerate(slices):
+            frac, noise = s["fraction"], s["noise"]
+            n_rows = int(total_len * frac)
+            
+            sub_df = df.iloc[current_idx:current_idx + n_rows].copy()
+            current_idx += n_rows
+            
+            if noise > 0:
+                n_type = s.get("type", "normal")
+                target_vals = sub_df[c_cfg["target_col"]].astype(float)
+                smiles_vals = sub_df[c_cfg["smiles_col"]].astype(str)
+                n_size = len(sub_df)
+                
+                if n_type == "normal":
+                    noise_arr = np.random.normal(scale=noise, size=n_size)
+                elif n_type == "cosh":
+                    from scipy.stats import rv_continuous
+                    class cosh_dis(rv_continuous):
+                        def __init__(self, loc):
+                            super().__init__(a=-loc, b=loc)
+                            self.scale_p = 2*np.sinh(loc)
+                        def _pdf(self, x):
+                            return np.cosh(x)/self.scale_p
+                    distribution = cosh_dis(1.543404638418213)
+                    noise_arr = distribution.rvs(size=n_size)
+                elif n_type == "uniform":
+                    from scipy import stats
+                    distribution = stats.uniform(-np.sqrt(3), 2*np.sqrt(3))
+                    noise_arr = distribution.rvs(size=n_size)
+                elif n_type == "bimodal":
+                    noise_arr = np.random.normal(scale=0.866025, size=n_size) + np.random.choice([-0.5, 0.5], size=n_size)
+                elif n_type == "half_and_half":
+                    noise_arr = np.where(target_vals > 0,
+                                         np.random.normal(scale=noise, size=n_size),
+                                         np.random.normal(scale=noise/10.0 if noise > 0 else 2, size=n_size))
+                elif n_type == "nitrogen":
+                    has_n = smiles_vals.str.contains('N|n', regex=True, na=False)
+                    noise_arr = np.where(has_n,
+                                         np.random.normal(scale=noise, size=n_size),
+                                         np.random.normal(scale=noise/10.0 if noise > 0 else 2, size=n_size))
+                else:
+                    noise_arr = np.random.normal(scale=noise, size=n_size)
+                    
+                sub_df[c_cfg["target_col"]] = target_vals + noise_arr
+                
+            sub_df["noise_level"] = noise
+            sub_df["noise_type"] = s.get("type", "normal") if noise > 0 else "none"
+            slice_dfs.append(sub_df)
+            
+        combined = pd.concat(slice_dfs, ignore_index=True)
+        # Final mix of distinct ranges
+        combined = combined.sample(frac=1, random_state=42).reset_index(drop=True)
+        
+        out_name = f"{split}_prepared.csv"
+        out_path = WORKSPACE / out_name
+        combined.to_csv(out_path, index=False)
+        state["prepared"][split] = out_name
+        
+        # 2. Augment if requested
+        if p_cfg["augment"]:
+            info(f"Augmenting {split}...")
+            if not _ensure_rdkit():
+                continue
+                
+            from augment_dataset import mirror_molecule, enumerate_tautomers
+            
+            aug_rows = []
+            with Progress(
+                SpinnerColumn("dots", style="cyan"),
+                TextColumn("[brand]{task.description}[/brand]"),
+                BarColumn(complete_style="cyan", finished_style="green"),
+                TimeElapsedColumn(), console=console
+            ) as prog:
+                task_id = prog.add_task("Augmenting...", total=len(combined))
+                
+                for _, row in combined.iterrows():
+                    smi = row[c_cfg["smiles_col"]]
+                    base_dict = row.to_dict()
+                    
+                    orig_dict = base_dict.copy()
+                    orig_dict["augmentation"] = "original"
+                    aug_rows.append(orig_dict)
+                    
+                    if c_cfg["do_mirror"]:
+                        try:
+                            m_smi = mirror_molecule(smi)
+                            if m_smi:
+                                m_dict = base_dict.copy()
+                                m_dict[c_cfg["smiles_col"]] = m_smi
+                                m_dict["augmentation"] = "mirror"
+                                aug_rows.append(m_dict)
+                        except Exception: pass
+                        
+                    if c_cfg["do_tautomers"]:
+                        try:
+                            for t_smi in enumerate_tautomers(smi, max_tautomers=c_cfg["max_tautomers"]):
+                                t_dict = base_dict.copy()
+                                t_dict[c_cfg["smiles_col"]] = t_smi
+                                t_dict["augmentation"] = "tautomer"
+                                aug_rows.append(t_dict)
+                        except Exception: pass
+                        
+                    prog.advance(task_id)
+            
+            aug_df = pd.DataFrame(aug_rows)
+            aug_df.to_csv(out_path, index=False)
+            
+        save_state(state)
+        success(f"{split.capitalize()} Pipeline finished -> {out_name}")
+
+
+# =============================================================================
+#  Execution Pipeline (Train)
+# =============================================================================
+
+def run_train_pipeline(state: dict, auto: bool = False):
+    train_prep = state["prepared"].get("train")
+    if not train_prep or not (WORKSPACE / train_prep).exists():
+        warn("No prepared train file. Run Data Preparation Pipeline first.")
+        return False
+
+    train_csv  = str(WORKSPACE / train_prep)
+    cfg        = state["config"]
+    attributes = cfg.get("attributes", [cfg["target_col"]])
+
+    val_prep = state["prepared"].get("val")
+    val_csv = (str(WORKSPACE / val_prep) if val_prep and (WORKSPACE / val_prep).exists() else None)
+
+    section("Train Pipeline Configuration")
+    tbl = Table(box=box.ROUNDED, border_style="cyan", expand=False, show_header=False)
+    tbl.add_column("Param",   style="accent", width=22)
+    tbl.add_column("Value",   style="white")
+    tbl.add_row("Train CSV",  train_csv)
+    tbl.add_row("Val CSV",    val_csv or "(none)")
+    tbl.add_row("Attributes", ", ".join(attributes))
+    tbl.add_row("Epochs",     str(cfg["epochs"]))
+    tbl.add_row("Batch size", str(cfg["batch_size"]))
+    tbl.add_row("Seed",       str(cfg["seed"]))
+    console.print(Padding(tbl, (0, 2)))
+
+    if not auto and not Confirm.ask("  [accent]Start Chemprop training?[/accent]", default=True):
+        return False
+
+    import subprocess
+    try:
+        subprocess.run(["chemprop", "--help"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        error("Chemprop CLI not found. Activate your conda env: conda activate chemprop")
+        return False
+
+    from gnn import train_chemprop
+
+    for attr in attributes:
+        section(f"Training: {attr}")
+        model_dir = str(WORKSPACE / "models" / f"model_{attr}")
         try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(active):
-                return active[idx]
-        except ValueError:
-            pass
-        error("Invalid selection — try a number from the list.")
+            train_chemprop(
+                train_csv=train_csv,
+                save_dir=model_dir,
+                target_col=attr,
+                epochs=cfg["epochs"],
+                batch_size=cfg["batch_size"],
+                seed=cfg["seed"],
+                val_csv=val_csv,
+                smiles_col=cfg["smiles_col"],
+            )
+            rel = str(Path(model_dir).relative_to(WORKSPACE))
+            state["models"][attr] = rel
+            save_state(state)
+            success(f"Model for [brand]{attr}[/brand] saved -> {model_dir}")
+        except Exception as e:
+            error(f"Training failed for {attr}: {e}")
+            return False
+            
+    return True
 
 
-def menu_main_action() -> str:
-    """Main action menu after CSV selection."""
-    section("What would you like to do?")
+# =============================================================================
+#  Config Editor
+# =============================================================================
 
-    actions = Table(box=box.SIMPLE, show_header=False, expand=False, padding=(0, 2))
-    actions.add_column("Key", style="brand", width=4)
-    actions.add_column("Action", style="white")
-    actions.add_column("Description", style="muted")
+_CONFIG_FIELDS = [
+    ("smiles_col",    "SMILES column name",            "str"),
+    ("target_col",    "Primary target column name",    "str"),
+    ("attributes",    "Train attributes (comma-sep)",  "list"),
+    ("epochs",        "Training epochs",               "int"),
+    ("batch_size",    "Batch size",                    "int"),
+    ("seed",          "Random seed",                   "int"),
+    ("max_tautomers", "Max tautomers per molecule",    "int"),
+    ("do_mirror",     "Enable mirror augmentation",    "bool"),
+    ("do_tautomers",  "Enable tautomer augmentation",  "bool"),
+]
 
-    actions.add_row("1", "🔬  Inspect dataset",       "Preview rows, columns, and stats")
-    actions.add_row("2", "⚗️   Augment dataset",       "Run mirror + tautomer augmentation")
-    actions.add_row("3", "📂  Pick a different file",  "Go back to file selection")
-    actions.add_row("q", "🚪  Quit",                   "Exit the tool")
-
-    console.print(Padding(actions, (0, 2)))
-    console.print()
-
-    choice = Prompt.ask(
-        "  [accent]Choose[/accent] [muted](1-3 or q)[/muted]",
-        choices=["1", "2", "3", "q"],
-        default="2",
-    )
-    return choice
-
-
-def menu_configure_augmentation(
-    csv_path: Path, cols: list[str]
-) -> dict | None:
-    """Interactive parameter configuration for augmentation."""
-    section("Configure augmentation")
-
-    # ── auto-detect columns ──
-    smiles_guess, target_guess = guess_columns(cols)
-
-    if smiles_guess:
-        success(f"Auto-detected SMILES column: [brand]{smiles_guess}[/brand]")
-    if target_guess:
-        success(f"Auto-detected target column: [brand]{target_guess}[/brand]")
-
-    console.print()
-
-    # SMILES column
-    if smiles_guess:
-        smiles_col = Prompt.ask(
-            "  [accent]SMILES column[/accent]",
-            default=smiles_guess,
-        )
-    else:
-        console.print(f"  Available columns: [muted]{', '.join(cols)}[/muted]")
-        smiles_col = Prompt.ask("  [accent]SMILES column[/accent]")
-    if smiles_col not in cols:
-        error(f"Column '{smiles_col}' not found. Aborting.")
-        return None
-
-    # Target column
-    if target_guess:
-        target_col = Prompt.ask(
-            "  [accent]Target column[/accent]",
-            default=target_guess,
-        )
-    else:
-        remaining = [c for c in cols if c != smiles_col]
-        console.print(f"  Remaining columns: [muted]{', '.join(remaining)}[/muted]")
-        target_col = Prompt.ask("  [accent]Target column[/accent]")
-    if target_col not in cols:
-        error(f"Column '{target_col}' not found. Aborting.")
-        return None
-
-    console.print()
-
-    # ── augmentation toggles ──
-    section("Augmentation methods")
-
-    toggle_table = Table(box=box.SIMPLE, show_header=False, expand=False, padding=(0, 1))
-    toggle_table.add_column("", width=3)
-    toggle_table.add_column("Method", style="white", width=24)
-    toggle_table.add_column("Description", style="muted")
-    toggle_table.add_row("1", "🪞  Mirror molecules", "Flip chiral centres → enantiomers (same H298)")
-    toggle_table.add_row("2", "🧪  Tautomers",        "Keto↔enol, imine↔enamine, etc. (same H298)")
-    console.print(Padding(toggle_table, (0, 2)))
-    console.print()
-
-    do_mirror = Confirm.ask(
-        "  [accent]Enable mirror molecules?[/accent]",
-        default=True,
-    )
-    do_tautomers = Confirm.ask(
-        "  [accent]Enable tautomer enumeration?[/accent]",
-        default=True,
-    )
-
-    max_tautomers = 5
-    if do_tautomers:
-        max_tautomers = IntPrompt.ask(
-            "  [accent]Max tautomers per molecule[/accent]",
-            default=5,
-        )
-
-    if not do_mirror and not do_tautomers:
-        warn("No augmentation methods selected. Nothing to do.")
-        return None
-
-    # ── output path ──
-    console.print()
-    default_out = csv_path.parent / f"{csv_path.stem}_augmented{csv_path.suffix}"
-    output_path = Prompt.ask(
-        "  [accent]Output path[/accent]",
-        default=str(default_out),
-    )
-
-    # ── confirmation ──
-    console.print()
-    confirm_table = Table(box=box.ROUNDED, border_style="cyan", expand=False, show_header=False)
-    confirm_table.add_column("Parameter", style="accent", width=22)
-    confirm_table.add_column("Value", style="white")
-
-    confirm_table.add_row("Input file", str(csv_path))
-    confirm_table.add_row("SMILES column", smiles_col)
-    confirm_table.add_row("Target column", target_col)
-    confirm_table.add_row("Mirror molecules", "✅  Yes" if do_mirror else "❌  No")
-    confirm_table.add_row("Tautomers", f"✅  Yes (max {max_tautomers})" if do_tautomers else "❌  No")
-    confirm_table.add_row("Output file", output_path)
-
-    console.print(Padding(confirm_table, (0, 2)))
-    console.print()
-
-    if not Confirm.ask("  [accent]Proceed with augmentation?[/accent]", default=True):
-        warn("Augmentation cancelled.")
-        return None
-
-    return {
-        "csv_path": csv_path,
-        "smiles_col": smiles_col,
-        "target_col": target_col,
-        "do_mirror": do_mirror,
-        "do_tautomers": do_tautomers,
-        "max_tautomers": max_tautomers,
-        "output_path": Path(output_path),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Main loop
-# ═══════════════════════════════════════════════════════════════════════════
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="MolAugment — interactive CLI")
-    parser.add_argument(
-        "--root", type=str, default=None,
-        help="Root directory to scan for CSVs (default: project root).",
-    )
-    args = parser.parse_args()
-
-    # Resolve project root
-    if args.root:
-        root = Path(args.root).resolve()
-    else:
-        root = Path(__file__).resolve().parent.parent   # assumes src/ lives under project root
-
-    clear()
-    banner()
-
-    # ── scan ──
-    with console.status("[brand]Scanning for CSV files …[/brand]", spinner="dots"):
-        csvs = scan_csvs(root)
-
-    if not csvs:
-        error(f"No CSV files found under {root}")
-        sys.exit(1)
-
-    success(f"Found [brand]{len(csvs)}[/brand] CSV file(s) under [muted]{root}[/muted]")
-
-    # ── main loop ──
-    selected: Path | None = None
+def menu_edit_config(state: dict):
+    cfg = state["config"]
 
     while True:
-        if selected is None:
-            selected = menu_select_csv(csvs, root)
-            if selected is None:
-                console.print("\n  [muted]Goodbye 👋[/muted]\n")
-                break
+        section("Edit Global Configuration")
+        opts = [f"{key:<15} [{cfg.get(key)}]" for key, _, _ in _CONFIG_FIELDS]
+        opts.append("-- Back --")
 
-        action = menu_main_action()
-
-        if action == "1":
-            inspect_csv(selected)
-            pause()
-
-        elif action == "2":
-            _, cols, _ = peek_csv(selected)
-            config = menu_configure_augmentation(selected, cols)
-            if config is not None:
-                console.print()
-                run_augmentation(**config)
-                pause()
-
-        elif action == "3":
-            selected = None  # go back to file picker
-
-        elif action == "q":
-            console.print("\n  [muted]Goodbye 👋[/muted]\n")
+        idx = curses_select(opts, title="Select Config to Edit")
+        if idx < 0 or idx == len(_CONFIG_FIELDS):
             break
 
+        key, desc, kind = _CONFIG_FIELDS[idx]
+        current_raw = cfg.get(key)
+
+        if kind == "bool":
+            cfg[key] = Confirm.ask(f"  [accent]{desc}[/accent]", default=bool(current_raw))
+        elif kind == "int":
+            cfg[key] = IntPrompt.ask(f"  [accent]{desc}[/accent]", default=int(current_raw))
+        elif kind == "list":
+            cur_str = ", ".join(current_raw) if current_raw else ""
+            new_str = Prompt.ask(f"  [accent]{desc}[/accent]", default=cur_str)
+            cfg[key] = [s.strip() for s in new_str.split(",") if s.strip()]
+        else:
+            cfg[key] = Prompt.ask(f"  [accent]{desc}[/accent]", default=str(current_raw))
+
+        save_state(state)
+        success(f"[brand]{key}[/brand] updated.")
+
+
+# =============================================================================
+#  Main Menu
+# =============================================================================
+
+def menu_preparation(state: dict):
+    while True:
+        opts = [
+            "Configure Train Split",
+            "Configure Test Split",
+            "Configure Validation Split",
+            "Run Data Preparation Pipeline",
+            "-- Back --"
+        ]
+        
+        idx = curses_select(opts, title="Preparation Pipeline")
+        if idx < 0 or idx == 4:
+            break
+            
+        elif idx == 0: menu_pipeline_split(state, "train")
+        elif idx == 1: menu_pipeline_split(state, "test")
+        elif idx == 2: menu_pipeline_split(state, "val")
+        elif idx == 3:
+            run_preparation_pipeline(state)
+            pause()
+
+
+def full_reset(state: dict):
+    if Confirm.ask("  [err]Are you sure you want to delete the whole workspace?[/err]", default=False):
+        try:
+            shutil.rmtree(WORKSPACE)
+            return copy.deepcopy(DEFAULT_STATE)
+        except Exception:
+            pass
+    return state
+
+
+def main():
+    clear()
+    state = load_state()
+
+    while True:
+        clear()
+        banner()
+        
+        opts = [
+            "Overview",
+            "Preparation Pipeline (Noise -> Merge -> Augment)",
+            "Train Pipeline (Chemprop)",
+            "Run Full Auto-Pipeline (Prepare + Train)",
+            "Settings / Config",
+            "Reset Workspace",
+            "Quit"
+        ]
+        
+        idx = curses_select(opts, title="Main Menu", subtitle=f"Workspace: {WORKSPACE}")
+        
+        if idx < 0 or idx == 6:
+            console.print("\n  [muted]Goodbye![/muted]\n")
+            break
+            
+        elif idx == 0:
+            print_status(state)
+            pause()
+        elif idx == 1:
+            menu_preparation(state)
+        elif idx == 2:
+            run_train_pipeline(state)
+            pause()
+        elif idx == 3:
+            run_preparation_pipeline(state)
+            run_train_pipeline(state, auto=True)
+            pause()
+        elif idx == 4:
+            menu_edit_config(state)
+        elif idx == 5:
+            state = full_reset(state)
 
 if __name__ == "__main__":
     main()

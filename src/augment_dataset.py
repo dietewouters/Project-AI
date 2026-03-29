@@ -159,28 +159,30 @@ def augment_dataset(
         smi = row[smiles_col]
         target = row[target_col]
 
+        base_dict = row.to_dict()
+        
         # keep the original
-        rows.append({smiles_col: smi, target_col: target, "augmentation": "original"})
+        orig_dict = base_dict.copy()
+        orig_dict["augmentation"] = "original"
+        rows.append(orig_dict)
 
         # --- 1. mirror (enantiomer) ---
         if do_mirror:
             mirror_smi = mirror_molecule(smi)
             if mirror_smi is not None:
-                rows.append({
-                    smiles_col: mirror_smi,
-                    target_col: target,   # H298 is identical for enantiomers
-                    "augmentation": "mirror",
-                })
+                m_dict = base_dict.copy()
+                m_dict[smiles_col] = mirror_smi
+                m_dict["augmentation"] = "mirror"
+                rows.append(m_dict)
                 mirror_count += 1
 
         # --- 2. tautomers ---
         if do_tautomers:
             for taut_smi in enumerate_tautomers(smi, max_tautomers=max_tautomers):
-                rows.append({
-                    smiles_col: taut_smi,
-                    target_col: target,   # same thermodynamic reference state
-                    "augmentation": "tautomer",
-                })
+                t_dict = base_dict.copy()
+                t_dict[smiles_col] = taut_smi
+                t_dict["augmentation"] = "tautomer"
+                rows.append(t_dict)
                 tautomer_count += 1
 
     aug_df = pd.DataFrame(rows)
