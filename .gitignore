@@ -239,3 +239,7 @@ __MACOSX/
 
 # Python virtual environments
 conda-env/
+
+# Data
+groupadditivity_h298/
+src/cli_workspace/

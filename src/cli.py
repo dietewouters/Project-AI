@@ -511,12 +511,19 @@ def _ensure_rdkit() -> bool:
 def run_preparation_pipeline(state: dict):
     section("Data Preparation Pipeline Execution")
     
-    tasks = [sp for sp in SPLIT_NAMES if state["pipelines"][sp]["base_file"]]
-    if not tasks:
+    # Force the order to Val -> Test -> Train to prioritize clean validation sets
+    ordered_tasks = []
+    for sp in ["val", "test", "train"]:
+        if state["pipelines"][sp]["base_file"]:
+            ordered_tasks.append(sp)
+
+    if not ordered_tasks:
         warn("No splits have a base file assigned. Configure the pipeline first.")
         return
         
-    for split in tasks:
+    global_used_smiles = set()
+    
+    for split in ordered_tasks:
         p_cfg = state["pipelines"][split]
         c_cfg = state["config"]
         base_path = WORKSPACE / p_cfg["base_file"]
@@ -527,13 +534,25 @@ def run_preparation_pipeline(state: dict):
             
         info(f"Processing split: {split}")
         
-        # 1. Load and slice/noise
+        # 1. Load data
         df = pd.read_csv(base_path)
         if c_cfg["smiles_col"] not in df.columns or c_cfg["target_col"] not in df.columns:
             error(f"Columns {c_cfg['smiles_col']} or {c_cfg['target_col']} missing in {base_path.name}")
             continue
+        
+        original_len = len(df)
+        
+        # 2. Filter out globally used SMILES to prevent data leakage across splits
+        smiles_col = c_cfg["smiles_col"]
+        if global_used_smiles:
+            df = df[~df[smiles_col].isin(global_used_smiles)].copy()
             
-        # Shuffle completely before slicing
+        remaining_len = len(df)
+        
+        if remaining_len < original_len:
+            info(f"  Filtered out {original_len - remaining_len} duplicated overlapping SMILES. Remaining: {remaining_len}")
+            
+        # 3. Shuffle completely before slicing
         df = df.sample(frac=1, random_state=c_cfg["seed"]).reset_index(drop=True)
         
         slices = p_cfg["slices"]
@@ -542,19 +561,75 @@ def run_preparation_pipeline(state: dict):
             
         slice_dfs = []
         current_idx = 0
-        total_len = len(df)
         
         for idx, s in enumerate(slices):
             frac, noise = s["fraction"], s["noise"]
-            n_rows = int(total_len * frac)
+            n_rows = int(original_len * frac)  # Calculate proportion based on original size
             
+            if current_idx + n_rows > remaining_len:
+                warn_msg = f"Not enough unused rows remain in {base_path.name} to fulfill slice {idx+1} of {split}. Using remaining {remaining_len - current_idx} rows."
+                warn(warn_msg)
+                n_rows = remaining_len - current_idx
+                
+            if n_rows <= 0:
+                continue
+                
             sub_df = df.iloc[current_idx:current_idx + n_rows].copy()
             current_idx += n_rows
             
+            # Register claimed SMILES globally
+            global_used_smiles.update(sub_df[smiles_col].tolist())
+            
+            # --- AUGMENTATION ---
+            if p_cfg.get("augment", False) and _ensure_rdkit():
+                from augment_dataset import mirror_molecule, enumerate_tautomers
+                
+                aug_rows = []
+                with Progress(
+                    SpinnerColumn("dots", style="cyan"),
+                    TextColumn(f"[brand]Augmenting slice {idx+1}...[/brand]"),
+                    BarColumn(complete_style="cyan", finished_style="green"),
+                    TimeElapsedColumn(), console=console
+                ) as prog:
+                    task_id = prog.add_task("Augmenting", total=len(sub_df))
+                    
+                    for _, row in sub_df.iterrows():
+                        smi = row[smiles_col]
+                        base_dict = row.to_dict()
+                        
+                        orig_dict = base_dict.copy()
+                        orig_dict["augmentation"] = "original"
+                        aug_rows.append(orig_dict)
+                        
+                        if c_cfg["do_mirror"]:
+                            try:
+                                m_smi = mirror_molecule(smi)
+                                if m_smi:
+                                    m_dict = base_dict.copy()
+                                    m_dict[smiles_col] = m_smi
+                                    m_dict["augmentation"] = "mirror"
+                                    aug_rows.append(m_dict)
+                            except Exception: pass
+                            
+                        if c_cfg["do_tautomers"]:
+                            try:
+                                for t_smi in enumerate_tautomers(smi, max_tautomers=c_cfg["max_tautomers"]):
+                                    t_dict = base_dict.copy()
+                                    t_dict[smiles_col] = t_smi
+                                    t_dict["augmentation"] = "tautomer"
+                                    aug_rows.append(t_dict)
+                            except Exception: pass
+                            
+                        prog.advance(task_id)
+                sub_df = pd.DataFrame(aug_rows)
+            else:
+                sub_df["augmentation"] = "original"
+
+            # --- NOISE INJECTION ---
             if noise > 0:
                 n_type = s.get("type", "normal")
                 target_vals = sub_df[c_cfg["target_col"]].astype(float)
-                smiles_vals = sub_df[c_cfg["smiles_col"]].astype(str)
+                smiles_vals = sub_df[smiles_col].astype(str)
                 n_size = len(sub_df)
                 
                 if n_type == "normal":
@@ -593,6 +668,10 @@ def run_preparation_pipeline(state: dict):
             sub_df["noise_type"] = s.get("type", "normal") if noise > 0 else "none"
             slice_dfs.append(sub_df)
             
+        if not slice_dfs:
+            warn(f"Skipping {split} because absolutely no rows were available (likely entirely consumed by previous splits).")
+            continue
+
         combined = pd.concat(slice_dfs, ignore_index=True)
         # Final mix of distinct ranges
         combined = combined.sample(frac=1, random_state=42).reset_index(drop=True)
@@ -602,55 +681,6 @@ def run_preparation_pipeline(state: dict):
         combined.to_csv(out_path, index=False)
         state["prepared"][split] = out_name
         
-        # 2. Augment if requested
-        if p_cfg["augment"]:
-            info(f"Augmenting {split}...")
-            if not _ensure_rdkit():
-                continue
-                
-            from augment_dataset import mirror_molecule, enumerate_tautomers
-            
-            aug_rows = []
-            with Progress(
-                SpinnerColumn("dots", style="cyan"),
-                TextColumn("[brand]{task.description}[/brand]"),
-                BarColumn(complete_style="cyan", finished_style="green"),
-                TimeElapsedColumn(), console=console
-            ) as prog:
-                task_id = prog.add_task("Augmenting...", total=len(combined))
-                
-                for _, row in combined.iterrows():
-                    smi = row[c_cfg["smiles_col"]]
-                    base_dict = row.to_dict()
-                    
-                    orig_dict = base_dict.copy()
-                    orig_dict["augmentation"] = "original"
-                    aug_rows.append(orig_dict)
-                    
-                    if c_cfg["do_mirror"]:
-                        try:
-                            m_smi = mirror_molecule(smi)
-                            if m_smi:
-                                m_dict = base_dict.copy()
-                                m_dict[c_cfg["smiles_col"]] = m_smi
-                                m_dict["augmentation"] = "mirror"
-                                aug_rows.append(m_dict)
-                        except Exception: pass
-                        
-                    if c_cfg["do_tautomers"]:
-                        try:
-                            for t_smi in enumerate_tautomers(smi, max_tautomers=c_cfg["max_tautomers"]):
-                                t_dict = base_dict.copy()
-                                t_dict[c_cfg["smiles_col"]] = t_smi
-                                t_dict["augmentation"] = "tautomer"
-                                aug_rows.append(t_dict)
-                        except Exception: pass
-                        
-                    prog.advance(task_id)
-            
-            aug_df = pd.DataFrame(aug_rows)
-            aug_df.to_csv(out_path, index=False)
-            
         save_state(state)
         success(f"{split.capitalize()} Pipeline finished -> {out_name}")
 
@@ -672,12 +702,16 @@ def run_train_pipeline(state: dict, auto: bool = False):
     val_prep = state["prepared"].get("val")
     val_csv = (str(WORKSPACE / val_prep) if val_prep and (WORKSPACE / val_prep).exists() else None)
 
+    test_prep = state["prepared"].get("test")
+    test_csv = (str(WORKSPACE / test_prep) if test_prep and (WORKSPACE / test_prep).exists() else None)
+
     section("Train Pipeline Configuration")
     tbl = Table(box=box.ROUNDED, border_style="cyan", expand=False, show_header=False)
     tbl.add_column("Param",   style="accent", width=22)
     tbl.add_column("Value",   style="white")
     tbl.add_row("Train CSV",  train_csv)
     tbl.add_row("Val CSV",    val_csv or "(none)")
+    tbl.add_row("Test CSV",   test_csv or "(none)")
     tbl.add_row("Attributes", ", ".join(attributes))
     tbl.add_row("Epochs",     str(cfg["epochs"]))
     tbl.add_row("Batch size", str(cfg["batch_size"]))
@@ -708,6 +742,7 @@ def run_train_pipeline(state: dict, auto: bool = False):
                 batch_size=cfg["batch_size"],
                 seed=cfg["seed"],
                 val_csv=val_csv,
+                test_csv=test_csv,
                 smiles_col=cfg["smiles_col"],
             )
             rel = str(Path(model_dir).relative_to(WORKSPACE))
