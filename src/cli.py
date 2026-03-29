@@ -83,8 +83,8 @@ SPLIT_NAMES = ("train", "test", "val")
 DEFAULT_STATE: dict[str, Any] = {
     "pipelines": {
         "train": {"base_file": None, "slices": [], "augment": False},
-        "test":  {"base_file": None, "slices": [], "augment": False},
-        "val":   {"base_file": None, "slices": [], "augment": False},
+        "test":  {"base_file": None, "slices": [], "augment": False, "sync": False},
+        "val":   {"base_file": None, "slices": [], "augment": False, "sync": False},
     },
     "prepared": {"train": None, "test": None, "val": None},
     "config": {
@@ -378,10 +378,16 @@ def print_status(state: dict):
         tbl.add_column("Value", style="muted")
 
         tbl.add_row("Base CSV", p_cfg["base_file"] or "None")
+        if p_cfg.get("sync"):
+            tbl.add_row("Sync", "[brand]ON (Follows Train)[/brand]")
+        
         if p_cfg["base_file"]:
-            slices_str = ", ".join(f"{s['fraction']*100}% at {s['noise']} noise" for s in p_cfg["slices"])
+            source_slices = state["pipelines"]["train"]["slices"] if p_cfg.get("sync") else p_cfg["slices"]
+            source_augment = state["pipelines"]["train"]["augment"] if p_cfg.get("sync") else p_cfg["augment"]
+            
+            slices_str = ", ".join(f"{s['fraction']*100}% at {s['noise']} noise" for s in source_slices)
             tbl.add_row("Slices", slices_str if slices_str else "100% at 0 noise")
-            tbl.add_row("Augment", "ON" if p_cfg["augment"] else "OFF")
+            tbl.add_row("Augment", "ON" if source_augment else "OFF")
 
             if prepared and (WORKSPACE / prepared).exists():
                 sz = (WORKSPACE / prepared).stat().st_size
@@ -413,11 +419,15 @@ def menu_pipeline_split(state: dict, split: str):
             f"Assign base CSV file  [{base}]",
             f"Manage noise slices    [{s_count} slices configured]",
             f"Toggle augmentation    [{aug_st}]",
-            "-- Back --"
         ]
+        if "sync" in p_cfg:
+            sync_st = "ON" if p_cfg["sync"] else "OFF"
+            opts.append(f"Sync with Train noise  [{sync_st}]")
+            
+        opts.append("-- Back --")
         
         idx = curses_select(opts, title=f"{split.capitalize()} Settings")
-        if idx < 0 or idx == 3:
+        if idx < 0 or idx == len(opts) - 1:
             break
             
         elif idx == 0:
@@ -434,10 +444,22 @@ def menu_pipeline_split(state: dict, split: str):
                 pause()
                 
         elif idx == 1:
-            menu_manage_slices(state, split)
+            if p_cfg.get("sync"):
+                warn("Manage slices is disabled when 'Sync with Train' is ON.")
+                pause()
+            else:
+                menu_manage_slices(state, split)
             
         elif idx == 2:
-            p_cfg["augment"] = not p_cfg["augment"]
+            if p_cfg.get("sync"):
+                warn("Toggle augmentation is disabled when 'Sync with Train' is ON.")
+                pause()
+            else:
+                p_cfg["augment"] = not p_cfg["augment"]
+                save_state(state)
+        
+        elif idx == 3 and "sync" in p_cfg:
+            p_cfg["sync"] = not p_cfg["sync"]
             save_state(state)
 
 
@@ -526,6 +548,16 @@ def run_preparation_pipeline(state: dict):
     for split in ordered_tasks:
         p_cfg = state["pipelines"][split]
         c_cfg = state["config"]
+        
+        # Determine effective slices/augment logic
+        if p_cfg.get("sync"):
+            source_cfg = state["pipelines"]["train"]
+            eff_slices = source_cfg["slices"]
+            eff_augment = source_cfg["augment"]
+        else:
+            eff_slices = p_cfg["slices"]
+            eff_augment = p_cfg["augment"]
+            
         base_path = WORKSPACE / p_cfg["base_file"]
         
         if not base_path.exists():
@@ -555,7 +587,7 @@ def run_preparation_pipeline(state: dict):
         # 3. Shuffle completely before slicing
         df = df.sample(frac=1, random_state=c_cfg["seed"]).reset_index(drop=True)
         
-        slices = p_cfg["slices"]
+        slices = eff_slices
         if not slices:
             slices = [{"fraction": 1.0, "noise": 0.0}]
             
@@ -581,10 +613,15 @@ def run_preparation_pipeline(state: dict):
             global_used_smiles.update(sub_df[smiles_col].tolist())
             
             # --- AUGMENTATION ---
-            if p_cfg.get("augment", False) and _ensure_rdkit():
+            if eff_augment and _ensure_rdkit():
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')
                 from augment_dataset import mirror_molecule, enumerate_tautomers
                 
                 aug_rows = []
+                mirrors_added = 0
+                tautomers_added = 0
+                
                 with Progress(
                     SpinnerColumn("dots", style="cyan"),
                     TextColumn(f"[brand]Augmenting slice {idx+1}...[/brand]"),
@@ -601,6 +638,8 @@ def run_preparation_pipeline(state: dict):
                         orig_dict["augmentation"] = "original"
                         aug_rows.append(orig_dict)
                         
+                        smiles_to_tautomerize = [smi]
+                        
                         if c_cfg["do_mirror"]:
                             try:
                                 m_smi = mirror_molecule(smi)
@@ -609,19 +648,25 @@ def run_preparation_pipeline(state: dict):
                                     m_dict[smiles_col] = m_smi
                                     m_dict["augmentation"] = "mirror"
                                     aug_rows.append(m_dict)
+                                    mirrors_added += 1
+                                    smiles_to_tautomerize.append(m_smi)
                             except Exception: pass
                             
                         if c_cfg["do_tautomers"]:
-                            try:
-                                for t_smi in enumerate_tautomers(smi, max_tautomers=c_cfg["max_tautomers"]):
-                                    t_dict = base_dict.copy()
-                                    t_dict[smiles_col] = t_smi
-                                    t_dict["augmentation"] = "tautomer"
-                                    aug_rows.append(t_dict)
-                            except Exception: pass
-                            
+                            for base_smi in smiles_to_tautomerize:
+                                try:
+                                    for t_smi in enumerate_tautomers(base_smi, max_tautomers=c_cfg["max_tautomers"]):
+                                        t_dict = base_dict.copy()
+                                        t_dict[smiles_col] = t_smi
+                                        # Distinguish if it originated from the mirror or the original
+                                        t_dict["augmentation"] = "mirror_tautomer" if base_smi != smi else "tautomer"
+                                        aug_rows.append(t_dict)
+                                        tautomers_added += 1
+                                except Exception: pass
+                                
                         prog.advance(task_id)
                 sub_df = pd.DataFrame(aug_rows)
+                info(f"    ↳ Slice {idx+1}: Added {mirrors_added} enantiomers and {tautomers_added} tautomers.")
             else:
                 sub_df["augmentation"] = "original"
 
