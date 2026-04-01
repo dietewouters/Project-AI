@@ -10,7 +10,7 @@ config = {
             # Training Parameters
             "lr" : 0.001,
             "batch_size" : 64,
-            "epochs" : 50,
+            "epochs" : 20,
             "optimizer" : "adam",
             "weight_decay" : 1e-5,
             "patience" : 10,
