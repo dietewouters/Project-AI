@@ -22,10 +22,4 @@ Model ignores noisy input → learns `fingerprint → true value` directly via g
 ### 3. Fingerprint Masking
 - Randomly drop bits during training
 - Model can't always reconstruct true value from structure alone → must use noisy value as prior
-
-### 4. Heteroscedastic / Multi-Fidelity
-- Add `σ_noise` as input feature
-- Model learns: low σ → trust measurement, high σ → trust structure
-- Actual data fusion, most interesting formulation
-
 ---
