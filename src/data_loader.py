@@ -18,34 +18,34 @@ from sklearn.model_selection import cross_val_predict
 # K-NN ADDED -------!!!!!!!!!!!!!!!!!
 
 class MoleculeDataset(Dataset):
-    def __init__(self, target_path: str, noisy_path: str, indices_path: str = None, scaler = None):
-        # ---- Load both files ----
+    def __init__(self, target_path: str, noisy_path: str, indices_path: str = None, scaler=None):
         target_df = pd.read_csv(target_path)
         noisy_df = pd.read_csv(noisy_path)
 
-        #---- Merge with indices file when full fingerprints ----
         df = pd.concat([target_df.reset_index(drop=True), noisy_df.reset_index(drop=True)], axis=1)
         df = df[["smiles", "fingerprint", "enthalpy", "h298"]]
         df.columns = ["molecule", "fingerprint", "input", "target"]
 
-        # ---- Optional scaling ----
         if scaler is not None:
             df["input"] = scaler.fit_transform(df[["input"]].values).squeeze()
             df["target"] = scaler.transform(df[["target"]].values).squeeze()
 
+        # ---- Delta target ----
+        df["delta"] = df["input"] - df["target"]
+
         fp_matrix = np.vstack(df["fingerprint"].apply(lambda x: np.array(list(x), dtype=np.uint8)))
 
-        # ---- Store as tensors ----
         self.names = df["molecule"].values
-        self.fp = torch.tensor(fp_matrix, dtype=torch.float32)  # shape (N, 2048)
+        self.fp = torch.tensor(fp_matrix, dtype=torch.float32)
         self.noisy = torch.tensor(df["input"].values, dtype=torch.float32).unsqueeze(1)
-        self.y = torch.tensor(df["target"].values, dtype=torch.float32)
+        self.y_delta = torch.tensor(df["delta"].values, dtype=torch.float32)
+        self.y_true = torch.tensor(df["target"].values, dtype=torch.float32)
 
-    def __len__(self): return len(self.y)
+    def __len__(self): return len(self.names)
 
     def __getitem__(self, idx):
-        x = torch.cat([self.fp[idx], self.noisy[idx]], dim=0)  # (2049,) for now
-        return x, self.y[idx]
+        #x = torch.cat([self.fp[idx], self.noisy[idx]], dim=0)
+        return self.fp[idx], self.noisy[idx], self.y_delta[idx], self.y_true[idx]
 
 class MoleculeDatasetKNN(MoleculeDataset):
     def __init__(self, target_path: str, noisy_path: str, k : int = 5, indices_path: str = None, scaler = None):
@@ -64,7 +64,7 @@ class MoleculeDatasetKNN(MoleculeDataset):
     def __getitem__(self, idx):
         # Combineer: Fingerprint (2048) + Noisy Value (1) + k-NN (1)
         # Dit resulteert in een input vector van (2050,)
-        x = torch.cat([self.fp[idx], self.noisy[idx], self.knn_val[idx]], dim=0)
+        x = torch.cat([self.fp[idx], self.noisy[idx], self.k_nn[idx]], dim=0)
 
         # Return de gecombineerde input en de target (zonder ruis)
         return x, self.y[idx]

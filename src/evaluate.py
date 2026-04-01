@@ -6,8 +6,9 @@ def evaluate(model, loader, criterion, device) -> float:
     total_loss = 0.0
 
     with torch.no_grad():
-        for X, y in loader:
-            X, y = X.to(device), y.to(device)
+        for fp, noisy, y_delta, _ in loader:
+            X = torch.cat([fp, noisy], dim=1).to(device)
+            y = y_delta.to(device)
             predictions = model(X)
             loss = criterion(predictions, y)
             total_loss += loss.item() * len(y)

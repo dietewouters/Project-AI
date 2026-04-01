@@ -19,6 +19,7 @@ class MLP(nn.Module):
 
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.BatchNorm1d(dims[i + 1]))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
 

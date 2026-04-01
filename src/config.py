@@ -4,7 +4,7 @@ import os
 config = {
             # Model Parameters
             "input_dim" : 2049,
-            "hidden_dims" : [1024, 512, 256],
+            "hidden_dims" : [1024, 512, 256, 128],
             "dropout" : 0.2,
 
             # Training Parameters

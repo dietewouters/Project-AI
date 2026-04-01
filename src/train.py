@@ -10,8 +10,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
     model.train()
     total_loss = 0.0
 
-    for X, y in loader:
-        X, y = X.to(device), y.to(device)
+    for fp, noisy, y_delta, _ in loader:
+        X = torch.cat([fp, noisy], dim=1).to(device)
+        y = y_delta.to(device)
 
         optimizer.zero_grad()
         predictions = model(X)

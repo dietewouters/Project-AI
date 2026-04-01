@@ -26,12 +26,17 @@ def main():
     DATA_DIR = config["data_path"]
     INDICES_DIR = os.path.join(DATA_DIR, "indices")
     DATASET_DIR = os.path.join(DATA_DIR, "dataset")
-    FINGERPRINT_DIR = os.path.join(DATASET_DIR, "fingerprints")
+    #FINGERPRINT_DIR = os.path.join(DATASET_DIR, "fingerprints")
     NOISE_DIR = os.path.join(DATASET_DIR, f"noise{NOISE}")
 
+    #TARGET_FILE = os.path.join(
+    #    FINGERPRINT_DIR, f"groupadditivity_{FRACTION}_fingerprints.csv"
+    #)
+
     TARGET_FILE = os.path.join(
-        FINGERPRINT_DIR, f"groupadditivity_{FRACTION}_fingerprints.csv"
+        DATASET_DIR, f"groupadditivity_{FRACTION}.csv"
     )
+
     TRAIN_FILE = os.path.join(
         NOISE_DIR, f"groupadditivity_{FRACTION}_noise{NOISE}.csv"
     )
