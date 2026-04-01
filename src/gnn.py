@@ -57,6 +57,7 @@ def train_chemprop(
     val_csv:    str | None = None,
     test_csv:   str | None = None,
     smiles_col: str = "smiles",
+    descriptor_columns: list[str] | None = None,
 ) -> str:
     """
     Train a Chemprop v2 regression model.
@@ -72,6 +73,7 @@ def train_chemprop(
     val_csv    : Optional validation CSV.
     test_csv   : Optional test CSV.
     smiles_col : Name of the SMILES column (used for pre-check only).
+    descriptor_columns : Optional list of column names to use as extra features.
 
     Returns
     -------
@@ -122,6 +124,11 @@ def train_chemprop(
         "--pytorch-seed",   str(seed),
         "--num-workers",    "0",  # Disable dataloader warnings
     ]
+
+    if descriptor_columns:
+        cmd.extend(["--descriptors-columns"] + descriptor_columns)
+        # Avoid scaling descriptors if they are targets (keep raw physics/units consistent)
+        cmd.extend(["--no-descriptor-scaling"])
     
     import re
     import os

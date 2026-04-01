@@ -22,6 +22,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from add_noise import add_noise
 
 # -- ensure sibling modules are importable ------------------------------------
 _SRC_DIR = str(Path(__file__).resolve().parent)
@@ -97,6 +98,7 @@ DEFAULT_STATE: dict[str, Any] = {
         "do_mirror":     True,
         "do_tautomers":  True,
         "attributes":    ["h298"],
+        "shuffle":       True,
     },
     "models": {},
 }
@@ -366,6 +368,7 @@ def print_status(state: dict):
     cfg_tbl.add_row("SMILES column", cfg["smiles_col"])
     cfg_tbl.add_row("Target column", cfg["target_col"])
     cfg_tbl.add_row("Attributes", ", ".join(cfg["attributes"]))
+    cfg_tbl.add_row("Shuffle Data", "[success]ENABLED[/success]" if cfg.get("shuffle", True) else "[err]DISABLED[/err]")
     console.print(Panel(cfg_tbl, title="[hi]Config[/hi]", border_style="cyan", expand=False))
 
     # Pipeline status
@@ -584,8 +587,9 @@ def run_preparation_pipeline(state: dict):
         if remaining_len < original_len:
             info(f"  Filtered out {original_len - remaining_len} duplicated overlapping SMILES. Remaining: {remaining_len}")
             
-        # 3. Shuffle completely before slicing
-        df = df.sample(frac=1, random_state=c_cfg["seed"]).reset_index(drop=True)
+        # 3. Shuffle completely before slicing (if enabled)
+        if c_cfg.get("shuffle", True):
+            df = df.sample(frac=1, random_state=c_cfg["seed"]).reset_index(drop=True)
         
         slices = eff_slices
         if not slices:
@@ -671,44 +675,17 @@ def run_preparation_pipeline(state: dict):
                 sub_df["augmentation"] = "original"
 
             # --- NOISE INJECTION ---
+            n_type = s.get("type", "normal")
+            target_vals = sub_df[c_cfg["target_col"]].values
+            smiles_vals = sub_df[smiles_col].values
+            
+            noise_arr = add_noise(target_vals, smiles_vals, n_type, noise)
+            
             if noise > 0:
-                n_type = s.get("type", "normal")
-                target_vals = sub_df[c_cfg["target_col"]].astype(float)
-                smiles_vals = sub_df[smiles_col].astype(str)
-                n_size = len(sub_df)
-                
-                if n_type == "normal":
-                    noise_arr = np.random.normal(scale=noise, size=n_size)
-                elif n_type == "cosh":
-                    from scipy.stats import rv_continuous
-                    class cosh_dis(rv_continuous):
-                        def __init__(self, loc):
-                            super().__init__(a=-loc, b=loc)
-                            self.scale_p = 2*np.sinh(loc)
-                        def _pdf(self, x):
-                            return np.cosh(x)/self.scale_p
-                    distribution = cosh_dis(1.543404638418213)
-                    noise_arr = distribution.rvs(size=n_size)
-                elif n_type == "uniform":
-                    from scipy import stats
-                    distribution = stats.uniform(-np.sqrt(3), 2*np.sqrt(3))
-                    noise_arr = distribution.rvs(size=n_size)
-                elif n_type == "bimodal":
-                    noise_arr = np.random.normal(scale=0.866025, size=n_size) + np.random.choice([-0.5, 0.5], size=n_size)
-                elif n_type == "half_and_half":
-                    noise_arr = np.where(target_vals > 0,
-                                         np.random.normal(scale=noise, size=n_size),
-                                         np.random.normal(scale=noise/10.0 if noise > 0 else 2, size=n_size))
-                elif n_type == "nitrogen":
-                    has_n = smiles_vals.str.contains('N|n', regex=True, na=False)
-                    noise_arr = np.where(has_n,
-                                         np.random.normal(scale=noise, size=n_size),
-                                         np.random.normal(scale=noise/10.0 if noise > 0 else 2, size=n_size))
-                else:
-                    noise_arr = np.random.normal(scale=noise, size=n_size)
+                sub_df[f"{c_cfg['target_col']}_noisy"] = target_vals + noise_arr
+            else:
+                sub_df[f"{c_cfg['target_col']}_noisy"] = target_vals.astype(float)
                     
-                sub_df[c_cfg["target_col"]] = target_vals + noise_arr
-                
             sub_df["noise_level"] = noise
             sub_df["noise_type"] = s.get("type", "normal") if noise > 0 else "none"
             slice_dfs.append(sub_df)
@@ -718,8 +695,9 @@ def run_preparation_pipeline(state: dict):
             continue
 
         combined = pd.concat(slice_dfs, ignore_index=True)
-        # Final mix of distinct ranges
-        combined = combined.sample(frac=1, random_state=42).reset_index(drop=True)
+        # Final mix of distinct ranges (if enabled)
+        if c_cfg.get("shuffle", True):
+            combined = combined.sample(frac=1, random_state=42).reset_index(drop=True)
         
         out_name = f"{split}_prepared.csv"
         out_path = WORKSPACE / out_name
@@ -789,6 +767,7 @@ def run_train_pipeline(state: dict, auto: bool = False):
                 val_csv=val_csv,
                 test_csv=test_csv,
                 smiles_col=cfg["smiles_col"],
+                descriptor_columns=[f"{attr}_noisy"],
             )
             rel = str(Path(model_dir).relative_to(WORKSPACE))
             state["models"][attr] = rel
@@ -815,6 +794,7 @@ _CONFIG_FIELDS = [
     ("max_tautomers", "Max tautomers per molecule",    "int"),
     ("do_mirror",     "Enable mirror augmentation",    "bool"),
     ("do_tautomers",  "Enable tautomer augmentation",  "bool"),
+    ("shuffle",       "Shuffle data in preparation",   "bool"),
 ]
 
 def menu_edit_config(state: dict):
