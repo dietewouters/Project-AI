@@ -1,6 +1,8 @@
 # Loading, splitting, preprocessing data
 
 import os
+from audioop import cross
+
 import pandas as pd
 import numpy as np
 #from sklearn.preprocessing import StandardScaler
@@ -8,6 +10,8 @@ import torch
 from config import config
 from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import cross_val_predict
 ###### THIS DATALOADER ONLY WORKS ON A SPECIFIC FRACTION OF THE DATA!! ##########
  ###### HAS TO BE UPDATED TO WORK ON THE ENTIRE DATASET!!!!! #####################
 
@@ -41,6 +45,28 @@ class MoleculeDataset(Dataset):
 
     def __getitem__(self, idx):
         x = torch.cat([self.fp[idx], self.noisy[idx]], dim=0)  # (2049,) for now
+        return x, self.y[idx]
+
+class MoleculeDatasetKNN(MoleculeDataset):
+    def __init__(self, target_path: str, noisy_path: str, k : int = 5, indices_path: str = None, scaler = None):
+        super().__init__(target_path, noisy_path, indices_path, scaler)
+        self.k_nn = self.compute_knn_features(k)
+
+    def compute_knn_features(self, k):
+        X = self.fp.numpy() # 2048-bit fingerprints
+        y = self.y.numpy() # targets
+
+        knn = KNeighborsRegressor(n_neighbors=k, metric='jaccard', n_jobs=-1) # Jaccard is Tanimoto in binary case
+
+        knn_features = cross_val_predict(knn, X, y, cv=5)
+        return torch.tensor(knn_features, dtype=torch.float32).unsqueeze(1)
+
+    def __getitem__(self, idx):
+        # Combineer: Fingerprint (2048) + Noisy Value (1) + k-NN (1)
+        # Dit resulteert in een input vector van (2050,)
+        x = torch.cat([self.fp[idx], self.noisy[idx], self.knn_val[idx]], dim=0)
+
+        # Return de gecombineerde input en de target (zonder ruis)
         return x, self.y[idx]
 
 def get_dataloaders(
