@@ -40,28 +40,6 @@ def plot_optimization_results(study: optuna.Study) -> None:
     plt.tight_layout()
     plt.show()
 
-# Deze werkte nog ni
-# def plot_param_importance(study: optuna.Study) -> None:
-#     try:
-#         importances = get_param_importances(study)
-
-#         if not importances:
-#             print("No parameter importances available.")
-#             return
-
-#         names = list(importances.keys())
-#         values = list(importances.values())
-
-#         plt.figure(figsize=(8, 5))
-#         plt.barh(names, values)
-#         plt.xlabel("Importance")
-#         plt.ylabel("Hyperparameter")
-#         plt.title("Hyperparameter Importance")
-#         plt.tight_layout()
-#         plt.show()
-
-#     except Exception as e:
-#         print(f"Could not plot parameter importances: {e}")
 
 def create_optuna_objective(base_config, train_dataset, val_dataset, device):
     def objective(trial):
@@ -115,7 +93,7 @@ def create_optuna_objective(base_config, train_dataset, val_dataset, device):
     return objective
 
 
-def run_optimization(base_config, train_dataset, val_dataset, device, n_trials: int = 20 ) -> dict:
+def run_optimization(base_config, train_dataset, val_dataset, device, n_trials: int = 3 ) -> dict:
     # ---- Create the study ----
     study = optuna.create_study(direction="minimize")
 

@@ -11,6 +11,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
     total_loss = 0.0
 
     for X, y in loader:
+    
         X, y = X.to(device), y.to(device)
 
         optimizer.zero_grad()

@@ -8,11 +8,18 @@ from config import config
 class MLP(nn.Module):
     def __init__(
         self,
-        input_dim: int = config["input_dim"],       # 2048 fingerprint bits + 1 noisy value
-        hidden_dims: list = config["hidden_dims"],
-        dropout: float = config["dropout"],
+        input_dim: int = None,
+        hidden_dims: list = None,
+        dropout: float = None,
     ):
         super().__init__()
+
+        if input_dim is None:
+            input_dim = config["input_dim"]
+        if hidden_dims is None:
+            hidden_dims = config["hidden_dims"]
+        if dropout is None:
+            dropout = config["dropout"]
 
         layers = []
         dims = [input_dim] + hidden_dims
@@ -22,7 +29,6 @@ class MLP(nn.Module):
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
 
-        # Output layer — single value, no activation for regression
         layers.append(nn.Linear(dims[-1], 1))
 
         self.network = nn.Sequential(*layers)
@@ -30,5 +36,5 @@ class MLP(nn.Module):
         print(self.network)
 
     def forward(self, x):
-        return self.network(x).squeeze(1)  # shape (batch_size,)
+        return self.network(x).squeeze(1)
 

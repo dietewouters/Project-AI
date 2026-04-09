@@ -5,10 +5,10 @@ config = {
             # Model Parameters
             "input_dim" : 2049,
             "hidden_dims" : [1024, 512, 256],
-            "dropout" : 0.2,
+            "dropout" : 0,
 
             # Training Parameters
-            "lr" : 0.001,
+            "lr" : 0.00001,
             "batch_size" : 64,
             "epochs" : 20,
             "optimizer" : "adam",
@@ -39,4 +39,22 @@ config_NN = {
 
             # Data Paths
             "data_path" : os.path.join(os.getcwd(), 'data', 'groupadditivity_h298')
+}
+
+config_VAE = {
+    # Model Parameters
+    "fp_input_dim": 2048,              # fingerprint
+    "hidden_dims": [1024, 512, 256],
+    "latent_dim": 1,                 # default 
+    "beta": 0.1    ,                  # KL weight
+
+    # Training Parameters
+    "lr": 0.001,
+    "batch_size": 64,
+    "epochs": 10,
+    "optimizer": "adam",
+    "num_workers": 0,
+
+    # Data
+    "data_path": os.path.join(os.getcwd(), 'data', 'groupadditivity_h298')
 }
