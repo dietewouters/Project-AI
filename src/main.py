@@ -45,12 +45,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
    
-    loaders = get_dataloaders(TARGET_FILE, TRAIN_FILE, INDICES_FILE)
+    loaders = get_dataloaders(TARGET_FILE, TRAIN_FILE, INDICES_DIR)
     print("OK Dataloaders")
 
     
     train_dataset = loaders["train"].dataset
     val_dataset = loaders["val"].dataset
+    test_dataset = loaders["test"].dataset
 
     # hyperparameter optimization
     best_config = run_optimization(
