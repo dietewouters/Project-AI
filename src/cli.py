@@ -88,6 +88,24 @@ DEFAULT_STATE: dict[str, Any] = {
         "val":   {"base_file": None, "slices": [], "augment": False, "sync": False},
     },
     "prepared": {"train": None, "test": None, "val": None},
+    "node_noise": {
+        "node_fraction": 0.0,
+        "dim_fraction":  0.0,
+        "layers":        [],
+    },
+    "scaffold_split": {
+        "enabled":    False,
+        "train_size": 0.8,
+        "val_size":   0.1,
+        "test_size":  0.1,
+        "use_generic": False,
+    },
+    "hpo": {
+        "enabled":    False,
+        "n_trials":   20,
+        "hpo_epochs": 10,
+        "best_params": None,
+    },
     "config": {
         "smiles_col":    "smiles",
         "target_col":    "h298",
@@ -371,6 +389,64 @@ def print_status(state: dict):
     cfg_tbl.add_row("Shuffle Data", "[success]ENABLED[/success]" if cfg.get("shuffle", True) else "[err]DISABLED[/err]")
     console.print(Panel(cfg_tbl, title="[hi]Config[/hi]", border_style="cyan", expand=False))
 
+    # Scaffold Split Summary
+    sc_cfg = state.get("scaffold_split", {})
+    if sc_cfg.get("enabled"):
+        sc_tbl = Table(box=box.SIMPLE, show_header=False, expand=False, padding=(0, 1))
+        sc_tbl.add_column("Key", style="accent", width=24)
+        sc_tbl.add_column("Value", style="white")
+        sc_tbl.add_row("Status", "[success]ENABLED[/success]")
+        sc_tbl.add_row("Train / Val / Test",
+                       f"{sc_cfg.get('train_size',0.8)*100:.0f}% / "
+                       f"{sc_cfg.get('val_size',0.1)*100:.0f}% / "
+                       f"{sc_cfg.get('test_size',0.1)*100:.0f}%")
+        sc_tbl.add_row("Scaffold type",
+                       "Generic (rings only)" if sc_cfg.get("use_generic") else "Murcko (with heteroatoms)")
+        console.print(Panel(sc_tbl, title="[hi]Scaffold Split[/hi]", border_style="green", expand=False))
+    else:
+        console.print(Panel("  [muted]Scaffold split: OFF — Using manually assigned CSVs[/muted]",
+                            title="[hi]Scaffold Split[/hi]", border_style="green", expand=False))
+
+    # Node Noise Summary
+    nn_cfg = state.get("node_noise", {})
+    nn_layers = nn_cfg.get("layers", [])
+    nn_nf = nn_cfg.get("node_fraction", 0.0)
+    nn_df = nn_cfg.get("dim_fraction", 0.0)
+    if nn_layers and nn_nf > 0 and nn_df > 0:
+        nn_tbl = Table(box=box.SIMPLE, show_header=False, expand=False, padding=(0, 1))
+        nn_tbl.add_column("Key", style="accent", width=24)
+        nn_tbl.add_column("Value", style="white")
+        nn_tbl.add_row("Node fraction", f"{nn_nf*100:.1f}%")
+        nn_tbl.add_row("Dimension fraction", f"{nn_df*100:.1f}%")
+        for i, layer in enumerate(nn_layers):
+            nn_tbl.add_row(f"Noise layer {i+1}", f"{layer.get('type','normal')} (scale={layer.get('scale',0):.4f})")
+        nn_tbl.add_row("Training mode", "[brand]Python API (node noise active)[/brand]")
+        console.print(Panel(nn_tbl, title="[hi]Node Feature Noise[/hi]", border_style="yellow", expand=False))
+    else:
+        console.print(Panel("  [muted]Node noise: OFF — Training uses Chemprop CLI[/muted]",
+                            title="[hi]Node Feature Noise[/hi]", border_style="yellow", expand=False))
+
+    # HPO Summary
+    hpo_cfg = state.get("hpo", {})
+    if hpo_cfg.get("enabled"):
+        hpo_tbl = Table(box=box.SIMPLE, show_header=False, expand=False, padding=(0, 1))
+        hpo_tbl.add_column("Key", style="accent", width=24)
+        hpo_tbl.add_column("Value", style="white")
+        hpo_tbl.add_row("Status", "[success]ENABLED[/success]")
+        hpo_tbl.add_row("Trials", str(hpo_cfg.get("n_trials", 20)))
+        hpo_tbl.add_row("Epochs/trial", str(hpo_cfg.get("hpo_epochs", 10)))
+        bp = hpo_cfg.get("best_params")
+        if bp:
+            bp_str = ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in bp.items())
+            hpo_tbl.add_row("Best params", f"[success]Cached[/success]")
+            hpo_tbl.add_row("", f"[muted]{bp_str[:80]}[/muted]")
+        else:
+            hpo_tbl.add_row("Best params", "[warn]Not yet tuned[/warn]")
+        console.print(Panel(hpo_tbl, title="[hi]Hyperparameter Optimisation[/hi]", border_style="magenta", expand=False))
+    else:
+        console.print(Panel("  [muted]HPO: OFF — Training uses default hyperparameters[/muted]",
+                            title="[hi]Hyperparameter Optimisation[/hi]", border_style="magenta", expand=False))
+
     # Pipeline status
     for split in SPLIT_NAMES:
         p_cfg = state["pipelines"][split]
@@ -521,6 +597,102 @@ def menu_manage_slices(state: dict, split: str):
 
 
 # =============================================================================
+#  Scaffold Splitting
+# =============================================================================
+
+def scaffold_split_dataframe(
+    df: pd.DataFrame,
+    smiles_col: str = "smiles",
+    train_size: float = 0.8,
+    val_size: float = 0.1,
+    test_size: float = 0.1,
+    seed: int = 42,
+    use_generic: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Split a dataframe by Murcko scaffold so that molecules with the same
+    core ring structure are kept in the same split.
+
+    Returns (train_df, val_df, test_df, stats_dict).
+    """
+    from collections import defaultdict
+    from rdkit import Chem
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+
+    # 1. Compute scaffold for each molecule
+    scaffolds: dict[str, list[int]] = defaultdict(list)
+    no_scaffold_indices = []
+
+    for i, smi in enumerate(df[smiles_col]):
+        mol = Chem.MolFromSmiles(str(smi))
+        if mol is None:
+            no_scaffold_indices.append(i)
+            continue
+        try:
+            core = MurckoScaffold.GetScaffoldForMol(mol)
+            if use_generic:
+                core = MurckoScaffold.MakeScaffoldGeneric(core)
+            scaffold_smi = Chem.MolToSmiles(core)
+            if not scaffold_smi or scaffold_smi == "":
+                scaffold_smi = "__no_rings__"
+        except Exception:
+            scaffold_smi = "__no_rings__"
+        scaffolds[scaffold_smi].append(i)
+
+    # 2. Sort scaffolds by size (largest first) for balanced assignment
+    scaffold_groups = sorted(scaffolds.items(), key=lambda x: len(x[1]), reverse=True)
+
+    # 3. Greedy assignment: each scaffold goes entirely to the split
+    #    that is furthest below its target count.
+    n = len(df)
+    target_counts = {
+        "train": int(n * train_size),
+        "val":   int(n * val_size),
+        "test":  int(n * test_size),
+    }
+    current_counts = {"train": 0, "val": 0, "test": 0}
+    assignments: dict[str, list[int]] = {"train": [], "val": [], "test": []}
+
+    rng = np.random.RandomState(seed)
+    # Shuffle scaffolds of same size for randomness
+    scaffold_groups_shuffled = []
+    i = 0
+    while i < len(scaffold_groups):
+        j = i
+        while j < len(scaffold_groups) and len(scaffold_groups[j][1]) == len(scaffold_groups[i][1]):
+            j += 1
+        group = list(scaffold_groups[i:j])
+        rng.shuffle(group)
+        scaffold_groups_shuffled.extend(group)
+        i = j
+
+    for scaffold_smi, indices in scaffold_groups_shuffled:
+        # Find the split with the largest remaining deficit
+        deficits = {s: target_counts[s] - current_counts[s] for s in ("train", "val", "test")}
+        best_split = max(deficits, key=deficits.get)
+        assignments[best_split].extend(indices)
+        current_counts[best_split] += len(indices)
+
+    # Add no-scaffold molecules to training
+    if no_scaffold_indices:
+        assignments["train"].extend(no_scaffold_indices)
+
+    train_df = df.iloc[sorted(assignments["train"])].copy().reset_index(drop=True)
+    val_df   = df.iloc[sorted(assignments["val"])].copy().reset_index(drop=True)
+    test_df  = df.iloc[sorted(assignments["test"])].copy().reset_index(drop=True)
+
+    stats = {
+        "total": n,
+        "n_scaffolds": len(scaffolds),
+        "train_count": len(train_df),
+        "val_count":   len(val_df),
+        "test_count":  len(test_df),
+        "no_scaffold":  len(no_scaffold_indices),
+    }
+    return train_df, val_df, test_df, stats
+
+
+# =============================================================================
 #  Execution Pipeline (Prep)
 # =============================================================================
 
@@ -535,7 +707,68 @@ def _ensure_rdkit() -> bool:
 
 def run_preparation_pipeline(state: dict):
     section("Data Preparation Pipeline Execution")
-    
+
+    sc_cfg = state.get("scaffold_split", {})
+    use_scaffold = sc_cfg.get("enabled", False)
+
+    # ── SCAFFOLD SPLIT MODE ────────────────────────────────────────────
+    if use_scaffold:
+        train_base = state["pipelines"]["train"].get("base_file")
+        if not train_base:
+            warn("Scaffold split is enabled but no base CSV is assigned to the Train pipeline.")
+            warn("Assign a CSV to Train first — scaffold split uses it as the single source.")
+            return
+
+        base_path = WORKSPACE / train_base
+        if not base_path.exists():
+            error(f"Base file {train_base} does not exist.")
+            return
+
+        if not _ensure_rdkit():
+            return
+
+        c_cfg = state["config"]
+        df_full = pd.read_csv(base_path)
+        if c_cfg["smiles_col"] not in df_full.columns or c_cfg["target_col"] not in df_full.columns:
+            error(f"Columns {c_cfg['smiles_col']} or {c_cfg['target_col']} missing in {base_path.name}")
+            return
+
+        info(f"Scaffold-splitting {len(df_full)} molecules from {train_base}...")
+
+        train_df, val_df, test_df, stats = scaffold_split_dataframe(
+            df_full,
+            smiles_col=c_cfg["smiles_col"],
+            train_size=sc_cfg.get("train_size", 0.8),
+            val_size=sc_cfg.get("val_size", 0.1),
+            test_size=sc_cfg.get("test_size", 0.1),
+            seed=c_cfg["seed"],
+            use_generic=sc_cfg.get("use_generic", False),
+        )
+
+        # Show scaffold stats
+        st_tbl = Table(box=box.ROUNDED, border_style="green", expand=False, show_header=False)
+        st_tbl.add_column("Stat", style="accent", width=22)
+        st_tbl.add_column("Value", style="white")
+        st_tbl.add_row("Total molecules",    str(stats["total"]))
+        st_tbl.add_row("Unique scaffolds",   str(stats["n_scaffolds"]))
+        st_tbl.add_row("Train",              f"{stats['train_count']} ({stats['train_count']/stats['total']*100:.1f}%)")
+        st_tbl.add_row("Validation",         f"{stats['val_count']} ({stats['val_count']/stats['total']*100:.1f}%)")
+        st_tbl.add_row("Test",               f"{stats['test_count']} ({stats['test_count']/stats['total']*100:.1f}%)")
+        if stats["no_scaffold"]:
+            st_tbl.add_row("No scaffold (→train)", str(stats["no_scaffold"]))
+        console.print(Padding(st_tbl, (0, 2)))
+
+        # Write scaffold-split CSVs into workspace so the per-split pipeline can pick them up
+        for split_name, split_df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+            out_name = f"_scaffold_{split_name}.csv"
+            split_df.to_csv(WORKSPACE / out_name, index=False)
+            state["pipelines"][split_name]["base_file"] = out_name
+
+        save_state(state)
+        success("Scaffold split written. Now running per-split noise/augmentation pipeline...")
+        console.print()
+
+    # ── STANDARD PER-SPLIT PIPELINE ────────────────────────────────────
     # Force the order to Val -> Test -> Train to prioritize clean validation sets
     ordered_tasks = []
     for sp in ["val", "test", "train"]:
@@ -712,6 +945,19 @@ def run_preparation_pipeline(state: dict):
 #  Execution Pipeline (Train)
 # =============================================================================
 
+def _has_node_noise(state: dict) -> bool:
+    """Return True when node noise is configured and should trigger Python API training."""
+    nn = state.get("node_noise", {})
+    return (nn.get("node_fraction", 0) > 0
+            and nn.get("dim_fraction", 0) > 0
+            and len(nn.get("layers", [])) > 0)
+
+
+def _needs_python_api(state: dict) -> bool:
+    """Return True when any feature requires the Python API training path."""
+    return _has_node_noise(state) or state.get("hpo", {}).get("enabled", False)
+
+
 def run_train_pipeline(state: dict, auto: bool = False):
     train_prep = state["prepared"].get("train")
     if not train_prep or not (WORKSPACE / train_prep).exists():
@@ -728,6 +974,11 @@ def run_train_pipeline(state: dict, auto: bool = False):
     test_prep = state["prepared"].get("test")
     test_csv = (str(WORKSPACE / test_prep) if test_prep and (WORKSPACE / test_prep).exists() else None)
 
+    use_python_api = _needs_python_api(state)
+
+    hpo_cfg = state.get("hpo", {})
+    hpo_enabled = hpo_cfg.get("enabled", False) and val_csv is not None
+
     section("Train Pipeline Configuration")
     tbl = Table(box=box.ROUNDED, border_style="cyan", expand=False, show_header=False)
     tbl.add_column("Param",   style="accent", width=22)
@@ -739,44 +990,135 @@ def run_train_pipeline(state: dict, auto: bool = False):
     tbl.add_row("Epochs",     str(cfg["epochs"]))
     tbl.add_row("Batch size", str(cfg["batch_size"]))
     tbl.add_row("Seed",       str(cfg["seed"]))
+    tbl.add_row("Training mode",
+                "[brand]Python API[/brand]" if use_python_api
+                else "[muted]Chemprop CLI[/muted]")
+    if hpo_enabled:
+        tbl.add_row("HPO",
+                    f"[brand]ENABLED[/brand] ({hpo_cfg.get('n_trials',20)} trials, "
+                    f"{hpo_cfg.get('hpo_epochs',10)} epochs/trial)")
+        if hpo_cfg.get("best_params"):
+            tbl.add_row("Cached best params", "[success]Available (skip HPO? will ask)[/success]")
+    else:
+        tbl.add_row("HPO", "[muted]OFF[/muted]")
+    if _has_node_noise(state):
+        nn = state["node_noise"]
+        tbl.add_row("Node fraction",  f"{nn['node_fraction']*100:.1f}%")
+        tbl.add_row("Dim fraction",   f"{nn['dim_fraction']*100:.1f}%")
+        for i, layer in enumerate(nn["layers"]):
+            tbl.add_row(f"Noise layer {i+1}", f"{layer['type']} (scale={layer['scale']:.4f})")
     console.print(Padding(tbl, (0, 2)))
 
     if not auto and not Confirm.ask("  [accent]Start Chemprop training?[/accent]", default=True):
         return False
 
-    import subprocess
-    try:
-        subprocess.run(["chemprop", "--help"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        error("Chemprop CLI not found. Activate your conda env: conda activate chemprop")
-        return False
-
-    from gnn import train_chemprop
-
-    for attr in attributes:
-        section(f"Training: {attr}")
-        model_dir = str(WORKSPACE / "models" / f"model_{attr}")
-        try:
-            train_chemprop(
-                train_csv=train_csv,
-                save_dir=model_dir,
-                target_col=attr,
-                epochs=cfg["epochs"],
-                batch_size=cfg["batch_size"],
-                seed=cfg["seed"],
-                val_csv=val_csv,
-                test_csv=test_csv,
-                smiles_col=cfg["smiles_col"],
-                descriptor_columns=[f"{attr}_noisy"],
+    # ── HPO phase ──────────────────────────────────────────────────────
+    tuned_hparams = None
+    if hpo_enabled and use_python_api:
+        reuse_cached = False
+        if hpo_cfg.get("best_params") and not auto:
+            reuse_cached = Confirm.ask(
+                "  [accent]Cached HPO results found. Reuse them?[/accent]",
+                default=True,
             )
-            rel = str(Path(model_dir).relative_to(WORKSPACE))
-            state["models"][attr] = rel
-            save_state(state)
-            success(f"Model for [brand]{attr}[/brand] saved -> {model_dir}")
-        except Exception as e:
-            error(f"Training failed for {attr}: {e}")
+
+        if reuse_cached:
+            tuned_hparams = hpo_cfg["best_params"]
+            info("Using cached best hyperparameters from previous HPO run.")
+        else:
+            section("Hyperparameter Optimisation")
+            try:
+                from hpo import run_hpo
+                best_params = run_hpo(
+                    train_csv=train_csv,
+                    val_csv=val_csv,
+                    target_col=attributes[0],  # HPO on primary attribute
+                    smiles_col=cfg["smiles_col"],
+                    descriptor_columns=[f"{attributes[0]}_noisy"],
+                    node_noise_config=state.get("node_noise") if _has_node_noise(state) else None,
+                    seed=cfg["seed"],
+                    n_trials=hpo_cfg.get("n_trials", 20),
+                    hpo_epochs=hpo_cfg.get("hpo_epochs", 10),
+                    save_dir=str(WORKSPACE / "hpo"),
+                )
+                tuned_hparams = best_params
+                state["hpo"]["best_params"] = best_params
+                save_state(state)
+                success("HPO complete! Best params saved.")
+            except ImportError:
+                error("Optuna not installed. Run: pip install optuna")
+                if not Confirm.ask("  [accent]Continue with default hyperparameters?[/accent]", default=True):
+                    return False
+            except Exception as e:
+                error(f"HPO failed: {e}")
+                import traceback; traceback.print_exc()
+                if not Confirm.ask("  [accent]Continue with default hyperparameters?[/accent]", default=True):
+                    return False
+
+    # ── Training phase ─────────────────────────────────────────────────
+    if use_python_api:
+        from gnn import train_chemprop_python
+
+        for attr in attributes:
+            section(f"Training: {attr}")
+            model_dir = str(WORKSPACE / "models" / f"model_{attr}")
+            try:
+                train_chemprop_python(
+                    train_csv=train_csv,
+                    save_dir=model_dir,
+                    target_col=attr,
+                    epochs=cfg["epochs"],
+                    batch_size=cfg["batch_size"],
+                    seed=cfg["seed"],
+                    val_csv=val_csv,
+                    test_csv=test_csv,
+                    smiles_col=cfg["smiles_col"],
+                    descriptor_columns=[f"{attr}_noisy"],
+                    node_noise_config=state.get("node_noise") if _has_node_noise(state) else None,
+                    tuned_hparams=tuned_hparams,
+                )
+                rel = str(Path(model_dir).relative_to(WORKSPACE))
+                state["models"][attr] = rel
+                save_state(state)
+                success(f"Model for [brand]{attr}[/brand] saved -> {model_dir}")
+            except Exception as e:
+                error(f"Training failed for {attr}: {e}")
+                import traceback; traceback.print_exc()
+                return False
+    else:
+        import subprocess
+        try:
+            subprocess.run(["chemprop", "--help"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            error("Chemprop CLI not found. Activate your conda env: conda activate chemprop")
             return False
-            
+
+        from gnn import train_chemprop
+
+        for attr in attributes:
+            section(f"Training: {attr}")
+            model_dir = str(WORKSPACE / "models" / f"model_{attr}")
+            try:
+                train_chemprop(
+                    train_csv=train_csv,
+                    save_dir=model_dir,
+                    target_col=attr,
+                    epochs=cfg["epochs"],
+                    batch_size=cfg["batch_size"],
+                    seed=cfg["seed"],
+                    val_csv=val_csv,
+                    test_csv=test_csv,
+                    smiles_col=cfg["smiles_col"],
+                    descriptor_columns=[f"{attr}_noisy"],
+                )
+                rel = str(Path(model_dir).relative_to(WORKSPACE))
+                state["models"][attr] = rel
+                save_state(state)
+                success(f"Model for [brand]{attr}[/brand] saved -> {model_dir}")
+            except Exception as e:
+                error(f"Training failed for {attr}: {e}")
+                return False
+
     return True
 
 
@@ -828,27 +1170,335 @@ def menu_edit_config(state: dict):
 
 
 # =============================================================================
+#  HPO Configuration Menu
+# =============================================================================
+
+def menu_hpo(state: dict):
+    """Interactive menu for configuring Optuna hyperparameter optimisation."""
+    hpo = state.setdefault("hpo", {
+        "enabled": False, "n_trials": 20, "hpo_epochs": 10, "best_params": None,
+    })
+
+    while True:
+        clear()
+        banner()
+        section("Hyperparameter Optimisation (HPO)")
+
+        enabled = hpo.get("enabled", False)
+        n_trials = hpo.get("n_trials", 20)
+        hpo_epochs = hpo.get("hpo_epochs", 10)
+        best_params = hpo.get("best_params")
+        status = "[success]ENABLED[/success]" if enabled else "[err]DISABLED[/err]"
+
+        console.print("  [muted]Optuna-based HPO uses the validation set to automatically[/muted]")
+        console.print("  [muted]find optimal model architecture and training parameters.[/muted]")
+        console.print("  [muted]HPO runs before training; best params are cached for reuse.[/muted]")
+        console.print()
+
+        if best_params:
+            bp_str = ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in best_params.items())
+            best_label = f"[success]Cached[/success]: {bp_str[:60]}{'...' if len(bp_str) > 60 else ''}"
+        else:
+            best_label = "[muted]None (will run HPO on next train)[/muted]"
+
+        opts = [
+            f"Toggle HPO                 [{status}]",
+            f"Set number of trials       [{n_trials}]",
+            f"Set epochs per trial       [{hpo_epochs}]",
+            f"Cached best params         [{best_label}]",
+            "Clear cached best params",
+            "-- Back --",
+        ]
+
+        idx = curses_select(opts, title="HPO Configuration")
+        if idx < 0 or idx == len(opts) - 1:
+            break
+
+        elif idx == 0:
+            hpo["enabled"] = not hpo["enabled"]
+            save_state(state)
+            if hpo["enabled"]:
+                success("HPO ENABLED.")
+                info("Before training, Optuna will search for optimal hyperparameters.")
+                info("Requires a validation set. Requires: pip install optuna")
+            else:
+                success("HPO DISABLED. Training uses default/manual hyperparameters.")
+            pause()
+
+        elif idx == 1:
+            console.print()
+            console.print("  [muted]More trials = better exploration but longer search time.[/muted]")
+            console.print("  [muted]Typical: 20-50 trials for a good search. 100+ for thorough.[/muted]")
+            v = IntPrompt.ask("  [accent]Number of trials[/accent]", default=n_trials)
+            hpo["n_trials"] = max(5, v)
+            save_state(state)
+
+        elif idx == 2:
+            console.print()
+            console.print("  [muted]Epochs per trial controls how long each trial trains.[/muted]")
+            console.print("  [muted]Shorter = faster search. 10-15 is a good balance.[/muted]")
+            console.print("  [muted]Bad trials get pruned early by Optuna automatically.[/muted]")
+            v = IntPrompt.ask("  [accent]Epochs per trial[/accent]", default=hpo_epochs)
+            hpo["hpo_epochs"] = max(3, v)
+            save_state(state)
+
+        elif idx == 3:
+            if best_params:
+                console.print()
+                from rich.table import Table as RTable
+                bp_tbl = RTable(box=box.ROUNDED, border_style="green", expand=False,
+                                title="[bold green]Cached Best Hyperparameters[/bold green]")
+                bp_tbl.add_column("Parameter", style="accent", width=18)
+                bp_tbl.add_column("Value", style="white")
+                for k, v in sorted(best_params.items()):
+                    bp_tbl.add_row(k, f"{v:.6g}" if isinstance(v, float) else str(v))
+                console.print(Padding(bp_tbl, (0, 2)))
+            else:
+                info("No cached params yet. Run training to trigger HPO.")
+            pause()
+
+        elif idx == 4:
+            hpo["best_params"] = None
+            save_state(state)
+            success("Cached best params cleared. HPO will re-run on next training.")
+            pause()
+
+
+# =============================================================================
 #  Main Menu
 # =============================================================================
 
+# =============================================================================
+#  Node Noise Configuration Menu
+# =============================================================================
+
+_NODE_NOISE_TYPES = ["normal", "uniform", "bimodal", "laplace"]
+
+def menu_node_noise(state: dict):
+    """Interactive menu for configuring node-level feature noise injection."""
+    nn = state.setdefault("node_noise", {"node_fraction": 0.0, "dim_fraction": 0.0, "layers": []})
+
+    while True:
+        clear()
+        banner()
+        section("Node Feature Noise")
+
+        nf = nn.get("node_fraction", 0.0)
+        df_frac = nn.get("dim_fraction", 0.0)
+        layers = nn.get("layers", [])
+        n_layers = len(layers)
+
+        active = nf > 0 and df_frac > 0 and n_layers > 0
+        status_str = "[success]ACTIVE[/success]" if active else "[err]INACTIVE[/err]"
+
+        opts = [
+            f"Set node fraction          [{nf*100:.1f}%]",
+            f"Set dimension fraction     [{df_frac*100:.1f}%]",
+            f"Manage noise layers        [{n_layers} layers]",
+            f"Status: {status_str}",
+            "Clear all node noise settings",
+            "-- Back --",
+        ]
+
+        idx = curses_select(opts, title="Node Feature Noise Config",
+                            subtitle="Noise injected into atom-feature vectors before message passing")
+        if idx < 0 or idx == len(opts) - 1:
+            break
+
+        elif idx == 0:
+            console.print()
+            console.print("  [muted]Fraction of atoms (nodes) to target per molecule.[/muted]")
+            console.print("  [muted]e.g. 0.33 = ~1 in 3 atoms (rounded up per molecule)[/muted]")
+            v = FloatPrompt.ask("  [accent]Node fraction (0.0 - 1.0)[/accent]", default=nf)
+            nn["node_fraction"] = max(0.0, min(1.0, v))
+            save_state(state)
+
+        elif idx == 1:
+            console.print()
+            console.print("  [muted]Fraction of feature-vector dimensions to perturb.[/muted]")
+            console.print("  [muted]The default atom vector has 72 dimensions.[/muted]")
+            v = FloatPrompt.ask("  [accent]Dimension fraction (0.0 - 1.0)[/accent]", default=df_frac)
+            nn["dim_fraction"] = max(0.0, min(1.0, v))
+            save_state(state)
+
+        elif idx == 2:
+            menu_node_noise_layers(state)
+
+        elif idx == 3:
+            # Just display — no action needed
+            if active:
+                info("Node noise is configured and will be applied during training.")
+                info("Training will use the Python API instead of the Chemprop CLI.")
+            else:
+                info("Set both fractions > 0 and add at least one noise layer to activate.")
+            pause()
+
+        elif idx == 4:
+            nn["node_fraction"] = 0.0
+            nn["dim_fraction"] = 0.0
+            nn["layers"] = []
+            save_state(state)
+            success("Node noise settings cleared.")
+            pause()
+
+
+def menu_node_noise_layers(state: dict):
+    """Manage the stackable noise layers for node features."""
+    nn = state["node_noise"]
+    layers = nn.setdefault("layers", [])
+
+    while True:
+        clear()
+        banner()
+        section("Node Noise Layers")
+
+        opts = []
+        for i, layer in enumerate(layers):
+            opts.append(f"Remove Layer {i+1}: {layer['type']} (scale={layer['scale']:.4f})")
+
+        opts.append("Add new noise layer")
+        opts.append("-- Done --")
+
+        idx = curses_select(opts, title="Stacked Noise Layers",
+                            subtitle="Layers are applied additively in order to the selected entries")
+        if idx < 0 or idx == len(opts) - 1:
+            break
+
+        if idx < len(layers):
+            # Remove selected layer
+            removed = layers.pop(idx)
+            save_state(state)
+            success(f"Removed layer: {removed['type']} (scale={removed['scale']:.4f})")
+            pause()
+        else:
+            # Add new layer
+            console.print()
+            t_idx = curses_select(_NODE_NOISE_TYPES, title="Select Noise Distribution")
+            if t_idx < 0:
+                continue
+            noise_type = _NODE_NOISE_TYPES[t_idx]
+
+            console.print()
+            scale = FloatPrompt.ask(
+                f"  [accent]Noise scale for {noise_type}[/accent]",
+                default=0.1,
+            )
+            if scale <= 0:
+                warn("Scale must be > 0.")
+                pause()
+                continue
+
+            layers.append({"type": noise_type, "scale": scale})
+            save_state(state)
+            success(f"Added layer: {noise_type} (scale={scale:.4f})")
+            pause()
+
+
+# =============================================================================
+#  Scaffold Split Configuration Menu
+# =============================================================================
+
+def menu_scaffold_split(state: dict):
+    """Interactive menu for configuring scaffold-based train/val/test splitting."""
+    sc = state.setdefault("scaffold_split", {
+        "enabled": False, "train_size": 0.8, "val_size": 0.1,
+        "test_size": 0.1, "use_generic": False,
+    })
+
+    while True:
+        clear()
+        banner()
+        section("Scaffold Split Configuration")
+
+        enabled   = sc.get("enabled", False)
+        tr_sz     = sc.get("train_size", 0.8)
+        va_sz     = sc.get("val_size", 0.1)
+        te_sz     = sc.get("test_size", 0.1)
+        generic   = sc.get("use_generic", False)
+        status    = "[success]ENABLED[/success]" if enabled else "[err]DISABLED[/err]"
+        gen_label = "Generic (rings only)" if generic else "Murcko (with heteroatoms)"
+
+        console.print("  [muted]Scaffold splitting ensures the test set contains[/muted]")
+        console.print("  [muted]chemical scaffolds NOT seen during training, testing[/muted]")
+        console.print("  [muted]the model's ability to generalise to novel structures.[/muted]")
+        console.print()
+
+        opts = [
+            f"Toggle scaffold split      [{status}]",
+            f"Set split ratios           [Train {tr_sz*100:.0f}% / Val {va_sz*100:.0f}% / Test {te_sz*100:.0f}%]",
+            f"Toggle scaffold type       [{gen_label}]",
+            "-- Back --",
+        ]
+
+        idx = curses_select(opts, title="Scaffold Split")
+        if idx < 0 or idx == len(opts) - 1:
+            break
+
+        elif idx == 0:
+            sc["enabled"] = not sc["enabled"]
+            save_state(state)
+            if sc["enabled"]:
+                success("Scaffold split ENABLED.")
+                info("During preparation, the Train base CSV will be scaffold-split")
+                info("into train/val/test before noise and augmentation.")
+            else:
+                success("Scaffold split DISABLED. Using manual per-split CSVs.")
+            pause()
+
+        elif idx == 1:
+            console.print()
+            console.print("  [muted]Enter ratios that sum to 1.0[/muted]")
+            new_tr = FloatPrompt.ask("  [accent]Train fraction[/accent]", default=tr_sz)
+            new_va = FloatPrompt.ask("  [accent]Validation fraction[/accent]", default=va_sz)
+            new_te = FloatPrompt.ask("  [accent]Test fraction[/accent]", default=te_sz)
+            total = new_tr + new_va + new_te
+            if abs(total - 1.0) > 0.01:
+                warn(f"Ratios sum to {total:.2f}, not 1.0. Normalising...")
+                new_tr /= total
+                new_va /= total
+                new_te /= total
+            sc["train_size"] = round(new_tr, 3)
+            sc["val_size"]   = round(new_va, 3)
+            sc["test_size"]  = round(new_te, 3)
+            save_state(state)
+            success(f"Split ratios: {sc['train_size']*100:.0f}% / {sc['val_size']*100:.0f}% / {sc['test_size']*100:.0f}%")
+            pause()
+
+        elif idx == 2:
+            sc["use_generic"] = not sc["use_generic"]
+            save_state(state)
+            if sc["use_generic"]:
+                info("Generic scaffolds: heteroatoms replaced with carbon, side chains removed.")
+                info("Results in fewer, larger scaffold clusters (stricter generalisation test).")
+            else:
+                info("Murcko scaffolds: preserves heteroatoms in the core ring system.")
+                info("More fine-grained scaffold groups (moderate generalisation test).")
+            pause()
+
+
 def menu_preparation(state: dict):
     while True:
+        sc_status = "ON" if state.get("scaffold_split", {}).get("enabled") else "OFF"
         opts = [
             "Configure Train Split",
             "Configure Test Split",
             "Configure Validation Split",
+            f"Configure Scaffold Split    [{sc_status}]",
+            "Configure Node Feature Noise",
             "Run Data Preparation Pipeline",
             "-- Back --"
         ]
         
         idx = curses_select(opts, title="Preparation Pipeline")
-        if idx < 0 or idx == 4:
+        if idx < 0 or idx == 6:
             break
             
         elif idx == 0: menu_pipeline_split(state, "train")
         elif idx == 1: menu_pipeline_split(state, "test")
         elif idx == 2: menu_pipeline_split(state, "val")
-        elif idx == 3:
+        elif idx == 3: menu_scaffold_split(state)
+        elif idx == 4: menu_node_noise(state)
+        elif idx == 5:
             run_preparation_pipeline(state)
             pause()
 
@@ -871,10 +1521,12 @@ def main():
         clear()
         banner()
         
+        hpo_status = "ON" if state.get("hpo", {}).get("enabled") else "OFF"
         opts = [
             "Overview",
             "Preparation Pipeline (Noise -> Merge -> Augment)",
             "Train Pipeline (Chemprop)",
+            f"Hyperparameter Optimisation  [{hpo_status}]",
             "Run Full Auto-Pipeline (Prepare + Train)",
             "Settings / Config",
             "Reset Workspace",
@@ -883,7 +1535,7 @@ def main():
         
         idx = curses_select(opts, title="Main Menu", subtitle=f"Workspace: {WORKSPACE}")
         
-        if idx < 0 or idx == 6:
+        if idx < 0 or idx == 7:
             console.print("\n  [muted]Goodbye![/muted]\n")
             break
             
@@ -896,12 +1548,14 @@ def main():
             run_train_pipeline(state)
             pause()
         elif idx == 3:
+            menu_hpo(state)
+        elif idx == 4:
             run_preparation_pipeline(state)
             run_train_pipeline(state, auto=True)
             pause()
-        elif idx == 4:
-            menu_edit_config(state)
         elif idx == 5:
+            menu_edit_config(state)
+        elif idx == 6:
             state = full_reset(state)
 
 if __name__ == "__main__":
