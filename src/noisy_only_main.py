@@ -14,14 +14,13 @@ def main():
     dataset_path = os.path.join(
         config["data_path"],
         "dataset",
-        "fingerprints/groupadditivity_0.004_fingerprints.csv"
+        "random noise added/groupadditivity_randomSetClean.csv"
     )
 
     noisy_path = os.path.join(
         config["data_path"],
         "dataset",
-        "noise0.4",
-        "groupadditivity_0.004_noise0.4.csv"
+        "random noise added/groupadditivity_randomSetNoisy.csv"
     )
 
     # ---- dataloaders ----
