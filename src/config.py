@@ -4,13 +4,13 @@ import os
 config = {
             # Model Parameters
             "input_dim" : 2049,
-            "hidden_dims" : [1024, 512, 256],
+            "hidden_dims" : [1024, 512, 256, 128],
             "dropout" : 0,
 
             # Training Parameters
             "lr" : 0.00001,
             "batch_size" : 64,
-            "epochs" : 20,
+            "epochs" : 30,
             "optimizer" : "adam",
             "weight_decay" : 1e-5,
             "patience" : 10,
@@ -45,7 +45,7 @@ config_VAE = {
     # Model Parameters
     "fp_input_dim": 2048,              # fingerprint
     "hidden_dims": [1024, 512, 256],
-    "latent_dim": 1,                 # default 
+    "latent_dim": 32,                 # default 
     "beta": 0.1    ,                  # KL weight
 
     # Training Parameters
