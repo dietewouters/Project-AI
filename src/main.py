@@ -21,13 +21,13 @@ def plot_history(history: dict):
 
 
 def main():
-    FRACTION = 0.004
+    FRACTION = 0.006
     NOISE = 0.01
     DATA_DIR = config["data_path"]
     INDICES_DIR = os.path.join(DATA_DIR, "indices")
     DATASET_DIR = os.path.join(DATA_DIR, "dataset")
     #FINGERPRINT_DIR = os.path.join(DATASET_DIR, "fingerprints")
-    NOISE_DIR = os.path.join(DATASET_DIR, f"noise20_half")
+    NOISE_DIR = os.path.join(DATASET_DIR, f"noise20_nitrogen")
 
     #TARGET_FILE = os.path.join(
     #    FINGERPRINT_DIR, f"groupadditivity_{FRACTION}_fingerprints.csv"
@@ -38,7 +38,7 @@ def main():
     )
 
     TRAIN_FILE = os.path.join(
-        NOISE_DIR, f"groupadditivity_{FRACTION}_noise20_half.csv"
+        NOISE_DIR, f"groupadditivity_{FRACTION}_noise20_nitrogen.csv"
     )
     INDICES_FILE = os.path.join(INDICES_DIR, f"indices_{FRACTION}.csv")
 
@@ -54,44 +54,44 @@ def main():
     test_dataset = loaders["test"].dataset
 
     # hyperparameter optimization
-    best_config = run_optimization(
-        base_config=config,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        device=device,
-        n_trials=10
-    )
+    #best_config = run_optimization(
+    #    base_config=config,
+    #    train_dataset=train_dataset,
+    #    val_dataset=val_dataset,
+    #    device=device,
+    #    n_trials=10
+    #)
 
-    print("\nBest config found:")
-    print(best_config)
+    #print("\nBest config found:")
+    #print(best_config)
 
     #
     final_loaders = {
         "train": DataLoader(
             train_dataset,
-            batch_size=best_config["batch_size"],
+            batch_size=config["batch_size"],
             shuffle=True
         ),
         "val": DataLoader(
             val_dataset,
-            batch_size=best_config["batch_size"],
+            batch_size=config["batch_size"],
             shuffle=False
         ),
         "test": DataLoader(
             test_dataset,
-            batch_size=best_config["batch_size"],
+            batch_size=config["batch_size"],
             shuffle=False
         )
     }
 
     # final model
     model = MLP(
-        input_dim=best_config["input_dim"],
-        hidden_dims=best_config["hidden_dims"],
-        dropout=best_config["dropout"],
+        input_dim=config["input_dim"],
+        hidden_dims=config["hidden_dims"],
+        dropout=config["dropout"],
     )
 
-    model, history = train(model, final_loaders, best_config, device)
+    model, history = train(model, final_loaders, config, device)
     plot_history(history)
 
 
