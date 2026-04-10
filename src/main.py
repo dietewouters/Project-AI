@@ -77,6 +77,11 @@ def main():
             batch_size=best_config["batch_size"],
             shuffle=False
         ),
+        "test": DataLoader(
+            test_dataset,
+            batch_size=best_config["batch_size"],
+            shuffle=False
+        )
     }
 
     # final model

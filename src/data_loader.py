@@ -15,37 +15,25 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import cross_val_predict
 ###### THIS DATALOADER ONLY WORKS ON A SPECIFIC FRACTION OF THE DATA!! ##########
  ###### HAS TO BE UPDATED TO WORK ON THE ENTIRE DATASET!!!!! #####################
-
-# K-NN ADDED -------!!!!!!!!!!!!!!!!!
-
 class MoleculeDataset(Dataset):
-    def __init__(self, target_path, noisy_path, indices_path, features_dir='data/processed_features', scaler=None):
-        # 1. Load CSVs (Smiles and h298 only)
+    def __init__(self, target_path, noisy_path, indices_path, features_dir='data/processed_features'):
+        
         t_df = pd.read_csv(target_path).rename(columns={"h298": "target", "smiles": "molecule"})
         n_df = pd.read_csv(noisy_path).rename(columns={"h298": "input"})
         df = pd.concat([t_df, n_df[["input"]]], axis=1)
-
-        # 2. Delta & Scaling
-        if scaler:
-            df["input"] = scaler.fit_transform(df[["input"]].values).squeeze()
-            df["target"] = scaler.transform(df[["target"]].values).squeeze()
-        df["delta"] = df["input"] - df["target"]
-
-        # 3. Load Features from Chunks using Global Indices
+        
+        
         with open(indices_path, 'r') as f:
             indices = [int(i) for i in f.read().split()]
         
-        # Load and stack all chunks into one large sparse bank
         chunks = sorted(glob.glob(os.path.join(features_dir, "*.npz")))
         feature_bank = sp.vstack([sp.load_npz(c) for c in chunks])
-        
-        # Pull only the fingerprints we need for these specific CSV rows
+
+
         fp_matrix = feature_bank[indices].toarray()
 
-        # 4. Final Tensors
         self.fp = torch.tensor(fp_matrix, dtype=torch.float32)
         self.noisy = torch.tensor(df["input"].values, dtype=torch.float32).unsqueeze(1)
-        self.y_delta = torch.tensor(df["delta"].values, dtype=torch.float32)
         self.y_true = torch.tensor(df["target"].values, dtype=torch.float32)
         self.names = df["molecule"].values
 
@@ -53,7 +41,20 @@ class MoleculeDataset(Dataset):
         return len(self.names)
 
     def __getitem__(self, idx):
-        return self.fp[idx], self.noisy[idx], self.y_delta[idx], self.y_true[idx]
+        return self._get_items(idx)
+
+    def _get_items(self, idx):
+        return self.fp[idx], self.noisy[idx], self.y_true[idx]
+
+class MoleculeDatasetDelta(MoleculeDataset):
+    def __init__(self, target_path, noisy_path, indices_path, features_dir='data/processed_features'):
+        # 1. Load CSVs (Smiles and h298 only)
+        super().__init__(target_path, noisy_path, indices_path)
+        self.y_delta = self.noisy - self.y_true.unsqueeze(1)
+
+    def _get_items(self, idx):
+        base_items = super()._get_items(idx)
+        return *base_items, self.y_delta[idx]
 
 class MoleculeDatasetKNN(MoleculeDataset):
     def __init__(self, target_path: str, noisy_path: str, k : int = 5, indices_path: str = None, scaler = None):
@@ -70,17 +71,15 @@ class MoleculeDatasetKNN(MoleculeDataset):
         return torch.tensor(knn_features, dtype=torch.float32).unsqueeze(1)
 
     def __getitem__(self, idx):
-        # Combineer: Fingerprint (2048) + Noisy Value (1) + k-NN (1)
-        # Dit resulteert in een input vector van (2050,)
         x = torch.cat([self.fp[idx], self.noisy[idx], self.k_nn[idx]], dim=0)
 
-        # Return de gecombineerde input en de target (zonder ruis)
         return x, self.y[idx]
 
 def get_dataloaders(
         dataset_path: str,
         noisy_path: str,
-        indices_dir: str
+        indices_dir: str,
+        method : int = 0        # 0 : standard, 1 : delta learning
 ):
     
     # Auto-resolve the specific indices filename based on the dataset CSV
@@ -92,10 +91,9 @@ def get_dataloaders(
         indices_filename = basename
     indices_path = os.path.join(indices_dir, indices_filename)
 
-    scaler = StandardScaler()
-    train_ds = MoleculeDataset(dataset_path, noisy_path, indices_path=indices_path, scaler=scaler)
-    val_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_secondarytest.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_secondarytest_noise0.01.csv', indices_path='data/groupadditivity_h298/indices/indices_secondarytest.csv', scaler=scaler)
-    test_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_test.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_test_noise0.01.csv', indices_path='data/groupadditivity_h298/indices/indices_test.csv', scaler=scaler)
+    train_ds = MoleculeDataset(dataset_path, noisy_path, indices_path=indices_path)
+    val_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_secondarytest.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_secondarytest_noise0.01.csv', indices_path='data/groupadditivity_h298/indices/indices_secondarytest.csv')
+    test_ds = MoleculeDataset('data/groupadditivity_h298/dataset/groupadditivity_test.csv', 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_test_noise0.01.csv', indices_path='data/groupadditivity_h298/indices/indices_test.csv')
     return {
         "train": DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=config["num_workers"]),
         "val": DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=config["num_workers"]),
