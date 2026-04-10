@@ -78,28 +78,22 @@ class NoisyMessagePassing(nn.Module):
     ----------
     inner : nn.Module
         The original ``MessagePassing`` module (e.g. ``BondMessagePassing``).
-    node_fraction : float
-        Fraction of nodes to perturb (0.0–1.0).  Rounded up per molecule so
-        at least 1 node is always targeted when > 0.
-    dim_fraction : float
-        Fraction of feature-vector dimensions to perturb (0.0–1.0).
-    noise_layers : list[dict]
-        Each dict has ``{"type": str, "scale": float}``.
-        They are applied additively in order.
+    configs : dict | None
+        Dictionary containing node noise config per split, e.g.:
+        {"train": {"node_fraction": 0.1, "dim_fraction": 0.5, "layers": [...]},
+         "val":   {...},
+         "test":  {...}}
     """
 
     def __init__(
         self,
         inner: nn.Module,
-        node_fraction: float = 0.0,
-        dim_fraction: float = 0.0,
-        noise_layers: list[dict] | None = None,
+        configs: dict | None = None,
     ):
         super().__init__()
         self.inner = inner
-        self.node_fraction = node_fraction
-        self.dim_fraction = dim_fraction
-        self.noise_layers = noise_layers or []
+        self.configs = configs or {}
+        self.current_split = "train"
 
     # -- delegate every attribute the MPNN might look up on message_passing --
     def __getattr__(self, name: str):
@@ -115,12 +109,17 @@ class NoisyMessagePassing(nn.Module):
 
     # -- core logic ----------------------------------------------------------
 
+    def _get_active_config(self) -> tuple[float, float, list[dict]]:
+        cfg = self.configs.get(self.current_split, {})
+        return cfg.get("node_fraction", 0.0), cfg.get("dim_fraction", 0.0), cfg.get("layers", [])
+
     def _build_node_mask(self, batch: Tensor, n_nodes: int,
+                         node_fraction: float,
                          device: torch.device) -> Tensor:
         """Return a boolean mask of shape ``(n_nodes,)`` selecting the target nodes."""
-        if self.node_fraction <= 0:
+        if node_fraction <= 0:
             return torch.zeros(n_nodes, dtype=torch.bool, device=device)
-        if self.node_fraction >= 1.0:
+        if node_fraction >= 1.0:
             return torch.ones(n_nodes, dtype=torch.bool, device=device)
 
         mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
@@ -130,7 +129,7 @@ class NoisyMessagePassing(nn.Module):
         for mid in mol_ids:
             mol_mask = batch == mid
             mol_size = mol_mask.sum().item()
-            k = max(1, math.ceil(mol_size * self.node_fraction))
+            k = max(1, math.ceil(mol_size * node_fraction))
             k = min(k, mol_size)
             # random k indices within this molecule
             mol_indices = mol_mask.nonzero(as_tuple=True)[0]
@@ -139,14 +138,14 @@ class NoisyMessagePassing(nn.Module):
 
         return mask
 
-    def _build_dim_mask(self, d_v: int, device: torch.device) -> Tensor:
+    def _build_dim_mask(self, d_v: int, dim_fraction: float, device: torch.device) -> Tensor:
         """Return a boolean mask of shape ``(d_v,)`` selecting the target dimensions."""
-        if self.dim_fraction <= 0:
+        if dim_fraction <= 0:
             return torch.zeros(d_v, dtype=torch.bool, device=device)
-        if self.dim_fraction >= 1.0:
+        if dim_fraction >= 1.0:
             return torch.ones(d_v, dtype=torch.bool, device=device)
 
-        k = max(1, math.ceil(d_v * self.dim_fraction))
+        k = max(1, math.ceil(d_v * dim_fraction))
         k = min(k, d_v)
         perm = torch.randperm(d_v, device=device)[:k]
         mask = torch.zeros(d_v, dtype=torch.bool, device=device)
@@ -154,22 +153,22 @@ class NoisyMessagePassing(nn.Module):
         return mask
 
     def forward(self, bmg, V_d: Tensor | None = None) -> Tensor:
-        if self.training and self.noise_layers and self.node_fraction > 0 and self.dim_fraction > 0:
+        nf, df_frac, layers = self._get_active_config()
+
+        if layers and nf > 0 and df_frac > 0:
             device = bmg.V.device
             n_nodes, d_v = bmg.V.shape
 
-            node_mask = self._build_node_mask(bmg.batch, n_nodes, device)
-            dim_mask  = self._build_dim_mask(d_v, device)
+            node_mask = self._build_node_mask(bmg.batch, n_nodes, nf, device)
+            dim_mask  = self._build_dim_mask(d_v, df_frac, device)
 
             # Outer product → (n_nodes, d_v) selection grid
-            # Only modify the entries where both masks are True
-            for layer in self.noise_layers:
+            for layer in layers:
                 noise_type = layer.get("type", "normal")
                 noise_scale = layer.get("scale", 0.0)
                 if noise_scale <= 0:
                     continue
 
-                # Generate full noise, then zero-out non-selected entries
                 n_selected_nodes = node_mask.sum().item()
                 n_selected_dims  = dim_mask.sum().item()
 
@@ -180,17 +179,16 @@ class NoisyMessagePassing(nn.Module):
                     (n_selected_nodes, n_selected_dims),
                     noise_type, noise_scale, device,
                 )
-                # Apply in-place via advanced indexing
                 bmg.V[node_mask.unsqueeze(1) & dim_mask.unsqueeze(0)] += noise.reshape(-1)
 
         return self.inner(bmg, V_d)
 
     def get_config_summary(self) -> str:
-        """Return a human-readable summary of the noise configuration."""
-        if not self.noise_layers or self.node_fraction <= 0 or self.dim_fraction <= 0:
-            return "Node noise: OFF"
+        train_cfg = self.configs.get("train", {})
+        if not train_cfg.get("layers") or train_cfg.get("node_fraction", 0) <= 0 or train_cfg.get("dim_fraction", 0) <= 0:
+            return "Node noise: OFF (Train)"
 
-        lines = [f"Node fraction: {self.node_fraction*100:.0f}%  |  Dim fraction: {self.dim_fraction*100:.0f}%"]
-        for i, layer in enumerate(self.noise_layers):
+        lines = [f"Train Node fraction: {train_cfg.get('node_fraction', 0)*100:.0f}%  |  Dim fraction: {train_cfg.get('dim_fraction', 0)*100:.0f}%"]
+        for i, layer in enumerate(train_cfg.get("layers", [])):
             lines.append(f"  Layer {i+1}: {layer.get('type','normal')} (scale={layer.get('scale',0):.4f})")
         return "\n".join(lines)

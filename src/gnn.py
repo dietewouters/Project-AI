@@ -275,6 +275,8 @@ def train_chemprop_python(
     descriptor_columns: list[str] | None = None,
     node_noise_config: dict | None = None,
     tuned_hparams: dict | None = None,
+    disable_output_scaling: bool = False,
+    disable_input_scaling: bool = False,
 ) -> str:
     """
     Train a Chemprop v2 regression model using the Python API.
@@ -298,6 +300,13 @@ def train_chemprop_python(
         If provided (from HPO), overrides model architecture and training
         hyperparameters: d_h, depth, dropout, ffn_hidden, ffn_layers,
         init_lr, max_lr, final_lr, batch_size, warmup_epochs.
+    disable_output_scaling : bool
+        If True, skip the output UnscaleTransform — the model must learn
+        the raw target distribution without standardisation anchoring.
+    disable_input_scaling : bool
+        If True, skip StandardScaler normalisation of the input descriptors
+        (x_d). When False (default), descriptors are standardised using the
+        training set mean/std before being fed to the FFN.
 
     Returns
     -------
@@ -375,20 +384,39 @@ def train_chemprop_python(
         test_ds, _ = _csv_to_dataset(test_csv)
 
     # ── compute scaling from training targets ──────────────────────────
-    train_targets = np.array([dp.y for dp in train_ds])
-    mean_val = float(np.nanmean(train_targets))
-    std_val  = float(np.nanstd(train_targets))
-    if std_val == 0:
-        std_val = 1.0
+    output_transform = None
+    if not disable_output_scaling:
+        train_targets = np.array([dp.y for dp in train_ds])
+        mean_val = float(np.nanmean(train_targets))
+        std_val  = float(np.nanstd(train_targets))
+        if std_val == 0:
+            std_val = 1.0
 
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler()
-    scaler.mean_  = np.array([mean_val])
-    scaler.scale_ = np.array([std_val])
-    scaler.var_   = np.array([std_val ** 2])
-    scaler.n_features_in_ = 1
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        scaler.mean_  = np.array([mean_val])
+        scaler.scale_ = np.array([std_val])
+        scaler.var_   = np.array([std_val ** 2])
+        scaler.n_features_in_ = 1
 
-    output_transform = UnscaleTransform.from_standard_scaler(scaler)
+        output_transform = UnscaleTransform.from_standard_scaler(scaler)
+        rprint("  [cyan]Output scaling: ENABLED[/cyan]")
+    else:
+        rprint("  [yellow]Output scaling: DISABLED (identity transform)[/yellow]")
+
+    # ── input descriptor scaling ─────────────────────────────────────
+    X_d_transform = None
+    if descriptor_columns and not disable_input_scaling:
+        # Standardise x_d columns in-place using training statistics
+        xd_scaler = train_ds.normalize_inputs("X_d")
+        if val_ds:
+            val_ds.normalize_inputs("X_d", scaler=xd_scaler)
+        if test_ds:
+            test_ds.normalize_inputs("X_d", scaler=xd_scaler)
+        X_d_transform = ScaleTransform.from_standard_scaler(xd_scaler)
+        rprint("  [cyan]Input descriptor scaling: ENABLED[/cyan]")
+    else:
+        rprint("  [yellow]Input descriptor scaling: DISABLED (raw values)[/yellow]")
 
     # ── resolve hyperparameters (tuned or defaults) ─────────────────────
     hp = tuned_hparams or {}
@@ -420,22 +448,39 @@ def train_chemprop_python(
     mp = BondMessagePassing(d_v=72, d_e=14, d_h=h_d_h, depth=h_depth, dropout=h_dropout)
 
     # >>> Wrap with node noise if configured <<<
-    if node_noise_config and node_noise_config.get("layers"):
-        nf = node_noise_config.get("node_fraction", 0.0)
-        df_frac = node_noise_config.get("dim_fraction", 0.0)
-        layers = node_noise_config.get("layers", [])
-        if nf > 0 and df_frac > 0 and layers:
-            mp = NoisyMessagePassing(
-                inner=mp,
-                node_fraction=nf,
-                dim_fraction=df_frac,
-                noise_layers=layers,
-            )
-            rprint(Panel(mp.get_config_summary(),
-                         title="[bold cyan]Node Noise Config[/bold cyan]",
-                         border_style="magenta"))
+    from node_noise import NoisyMessagePassing
+    
+    # We now assume node_noise_config is a dict mapping from split ("train", "val", "test")
+    # to their respective configurations. If it's a legacy flat dict, we wrap it.
+    if node_noise_config:
+        if "train" not in node_noise_config and "layers" in node_noise_config:
+            node_noise_config = {"train": node_noise_config}
+            
+        mp = NoisyMessagePassing(
+            inner=mp,
+            configs=node_noise_config,
+        )
+        rprint(Panel(mp.get_config_summary(),
+                     title="[bold yellow]Node Feature Noise[/bold yellow]", border_style="yellow"))
 
     agg = MeanAggregation()
+    
+    # Define SplitAwareMPNN to handle dynamic node noise switching
+    class SplitAwareMPNN(MPNN):
+        def training_step(self, *args, **kwargs):
+            if hasattr(self.message_passing, "current_split"):
+                self.message_passing.current_split = "train"
+            return super().training_step(*args, **kwargs)
+
+        def validation_step(self, *args, **kwargs):
+            if hasattr(self.message_passing, "current_split"):
+                self.message_passing.current_split = "val"
+            return super().validation_step(*args, **kwargs)
+
+        def test_step(self, *args, **kwargs):
+            if hasattr(self.message_passing, "current_split"):
+                self.message_passing.current_split = "test"
+            return super().test_step(*args, **kwargs)
 
     predictor_input_dim = h_d_h + d_xd
     ffn = RegressionFFN(
@@ -446,7 +491,7 @@ def train_chemprop_python(
         output_transform=output_transform,
     )
 
-    model = MPNN(
+    model = SplitAwareMPNN(
         message_passing=mp,
         agg=agg,
         predictor=ffn,
@@ -455,6 +500,7 @@ def train_chemprop_python(
         init_lr=h_init_lr,
         max_lr=h_max_lr,
         final_lr=h_final_lr,
+        X_d_transform=X_d_transform,
     )
 
     # ── dataloaders ────────────────────────────────────────────────────

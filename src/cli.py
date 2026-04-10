@@ -117,6 +117,8 @@ DEFAULT_STATE: dict[str, Any] = {
         "do_tautomers":  True,
         "attributes":    ["h298"],
         "shuffle":       True,
+        "disable_output_scaling": False,
+        "disable_input_scaling":  False,
     },
     "models": {},
 }
@@ -387,6 +389,12 @@ def print_status(state: dict):
     cfg_tbl.add_row("Target column", cfg["target_col"])
     cfg_tbl.add_row("Attributes", ", ".join(cfg["attributes"]))
     cfg_tbl.add_row("Shuffle Data", "[success]ENABLED[/success]" if cfg.get("shuffle", True) else "[err]DISABLED[/err]")
+    cfg_tbl.add_row("Output Scaling",
+                    "[err]DISABLED[/err]" if cfg.get("disable_output_scaling", False)
+                    else "[success]ENABLED[/success]")
+    cfg_tbl.add_row("Input Scaling",
+                    "[err]DISABLED[/err]" if cfg.get("disable_input_scaling", False)
+                    else "[success]ENABLED[/success]")
     console.print(Panel(cfg_tbl, title="[hi]Config[/hi]", border_style="cyan", expand=False))
 
     # Scaffold Split Summary
@@ -820,34 +828,44 @@ def run_preparation_pipeline(state: dict):
         if remaining_len < original_len:
             info(f"  Filtered out {original_len - remaining_len} duplicated overlapping SMILES. Remaining: {remaining_len}")
             
-        # 3. Shuffle completely before slicing (if enabled)
+        # 3. Handle slicing safely by grouping by SMILES
+        # Grouping by SMILES ensures that data splits are taken cleanly without
+        # splitting a single SMILES across boundaries, which would result in data loss
+        # during the 'global_used_smiles' anti-leakage filter step.
+        unique_smiles = df[smiles_col].unique()
         if c_cfg.get("shuffle", True):
-            df = df.sample(frac=1, random_state=c_cfg["seed"]).reset_index(drop=True)
-        
+            np.random.seed(c_cfg["seed"] + ord(split[0])) # Different shuffle per split
+            np.random.shuffle(unique_smiles)
+
         slices = eff_slices
         if not slices:
             slices = [{"fraction": 1.0, "noise": 0.0}]
             
         slice_dfs = []
         current_idx = 0
+        total_unique = len(unique_smiles)
         
         for idx, s in enumerate(slices):
             frac, noise = s["fraction"], s["noise"]
-            n_rows = int(original_len * frac)  # Calculate proportion based on original size
+            n_unique = int(total_unique * frac)  # Calculate proportion based on original SMILES count
             
-            if current_idx + n_rows > remaining_len:
-                warn_msg = f"Not enough unused rows remain in {base_path.name} to fulfill slice {idx+1} of {split}. Using remaining {remaining_len - current_idx} rows."
+            if current_idx + n_unique > len(unique_smiles):
+                warn_msg = f"Not enough unused SMILES remain in {base_path.name} to fulfill slice {idx+1} of {split}. Using remaining {len(unique_smiles) - current_idx} SMILES groups."
                 warn(warn_msg)
-                n_rows = remaining_len - current_idx
+                n_unique = len(unique_smiles) - current_idx
                 
-            if n_rows <= 0:
+            if n_unique <= 0:
                 continue
                 
-            sub_df = df.iloc[current_idx:current_idx + n_rows].copy()
-            current_idx += n_rows
+            selected_smiles = set(unique_smiles[current_idx:current_idx + n_unique])
+            current_idx += n_unique
+            
+            sub_df = df[df[smiles_col].isin(selected_smiles)].copy()
+            if len(sub_df) == 0:
+                continue
             
             # Register claimed SMILES globally
-            global_used_smiles.update(sub_df[smiles_col].tolist())
+            global_used_smiles.update(selected_smiles)
             
             # --- AUGMENTATION ---
             if eff_augment and _ensure_rdkit():
@@ -1040,6 +1058,8 @@ def run_train_pipeline(state: dict, auto: bool = False):
                     n_trials=hpo_cfg.get("n_trials", 20),
                     hpo_epochs=hpo_cfg.get("hpo_epochs", 10),
                     save_dir=str(WORKSPACE / "hpo"),
+                    disable_output_scaling=cfg.get("disable_output_scaling", False),
+                    disable_input_scaling=cfg.get("disable_input_scaling", False),
                 )
                 tuned_hparams = best_params
                 state["hpo"]["best_params"] = best_params
@@ -1076,6 +1096,8 @@ def run_train_pipeline(state: dict, auto: bool = False):
                     descriptor_columns=[f"{attr}_noisy"],
                     node_noise_config=state.get("node_noise") if _has_node_noise(state) else None,
                     tuned_hparams=tuned_hparams,
+                    disable_output_scaling=cfg.get("disable_output_scaling", False),
+                    disable_input_scaling=cfg.get("disable_input_scaling", False),
                 )
                 rel = str(Path(model_dir).relative_to(WORKSPACE))
                 state["models"][attr] = rel
@@ -1127,16 +1149,18 @@ def run_train_pipeline(state: dict, auto: bool = False):
 # =============================================================================
 
 _CONFIG_FIELDS = [
-    ("smiles_col",    "SMILES column name",            "str"),
-    ("target_col",    "Primary target column name",    "str"),
-    ("attributes",    "Train attributes (comma-sep)",  "list"),
-    ("epochs",        "Training epochs",               "int"),
-    ("batch_size",    "Batch size",                    "int"),
-    ("seed",          "Random seed",                   "int"),
-    ("max_tautomers", "Max tautomers per molecule",    "int"),
-    ("do_mirror",     "Enable mirror augmentation",    "bool"),
-    ("do_tautomers",  "Enable tautomer augmentation",  "bool"),
-    ("shuffle",       "Shuffle data in preparation",   "bool"),
+    ("smiles_col",      "SMILES column name",            "str"),
+    ("target_col",      "Primary target column name",    "str"),
+    ("attributes",      "Train attributes (comma-sep)",  "list"),
+    ("epochs",          "Training epochs",               "int"),
+    ("batch_size",      "Batch size",                    "int"),
+    ("seed",            "Random seed",                   "int"),
+    ("max_tautomers",   "Max tautomers per molecule",    "int"),
+    ("do_mirror",       "Enable mirror augmentation",    "bool"),
+    ("do_tautomers",    "Enable tautomer augmentation",  "bool"),
+    ("shuffle",         "Shuffle data in preparation",   "bool"),
+    ("disable_output_scaling", "Disable target output scaling", "bool"),
+    ("disable_input_scaling",  "Disable descriptor input scaling", "bool"),
 ]
 
 def menu_edit_config(state: dict):
@@ -1275,23 +1299,28 @@ def menu_hpo(state: dict):
 _NODE_NOISE_TYPES = ["normal", "uniform", "bimodal", "laplace"]
 
 def menu_node_noise(state: dict):
-    """Interactive menu for configuring node-level feature noise injection."""
-    nn = state.setdefault("node_noise", {"node_fraction": 0.0, "dim_fraction": 0.0, "layers": []})
+    """Interactive menu for configuring node-level feature noise injection per split."""
+    nn = state.setdefault("node_noise", {})
+    current_split = "train"
 
     while True:
         clear()
         banner()
         section("Node Feature Noise")
 
-        nf = nn.get("node_fraction", 0.0)
-        df_frac = nn.get("dim_fraction", 0.0)
-        layers = nn.get("layers", [])
+        # Initialize split config if missing
+        split_cfg = nn.setdefault(current_split, {"node_fraction": 0.0, "dim_fraction": 0.0, "layers": []})
+        
+        nf = split_cfg.get("node_fraction", 0.0)
+        df_frac = split_cfg.get("dim_fraction", 0.0)
+        layers = split_cfg.get("layers", [])
         n_layers = len(layers)
 
         active = nf > 0 and df_frac > 0 and n_layers > 0
-        status_str = "[success]ACTIVE[/success]" if active else "[err]INACTIVE[/err]"
+        status_str = f"[success]ACTIVE[/success] currently editing {current_split}" if active else f"[muted]INACTIVE[/muted] currently editing {current_split}"
 
         opts = [
+            f"Select Phase to configure (Current: {current_split.upper()})",
             f"Set node fraction          [{nf*100:.1f}%]",
             f"Set dimension fraction     [{df_frac*100:.1f}%]",
             f"Manage noise layers        [{n_layers} layers]",
@@ -1301,56 +1330,56 @@ def menu_node_noise(state: dict):
         ]
 
         idx = curses_select(opts, title="Node Feature Noise Config",
-                            subtitle="Noise injected into atom-feature vectors before message passing")
+                            subtitle="Noise injected into atom-feature vectors dynamically during model forward pass.")
         if idx < 0 or idx == len(opts) - 1:
             break
 
         elif idx == 0:
             console.print()
-            console.print("  [muted]Fraction of atoms (nodes) to target per molecule.[/muted]")
-            console.print("  [muted]e.g. 0.33 = ~1 in 3 atoms (rounded up per molecule)[/muted]")
-            v = FloatPrompt.ask("  [accent]Node fraction (0.0 - 1.0)[/accent]", default=nf)
-            nn["node_fraction"] = max(0.0, min(1.0, v))
-            save_state(state)
+            split_idx = curses_select(["train", "val", "test"], title="Select Phase to configure")
+            if split_idx >= 0:
+                current_split = ["train", "val", "test"][split_idx]
 
         elif idx == 1:
             console.print()
-            console.print("  [muted]Fraction of feature-vector dimensions to perturb.[/muted]")
-            console.print("  [muted]The default atom vector has 72 dimensions.[/muted]")
-            v = FloatPrompt.ask("  [accent]Dimension fraction (0.0 - 1.0)[/accent]", default=df_frac)
-            nn["dim_fraction"] = max(0.0, min(1.0, v))
+            console.print("  [muted]Fraction of atoms (nodes) to target per molecule.[/muted]")
+            v = FloatPrompt.ask("  [accent]Node fraction (0.0 - 1.0)[/accent]", default=nf)
+            split_cfg["node_fraction"] = max(0.0, min(1.0, v))
             save_state(state)
 
         elif idx == 2:
-            menu_node_noise_layers(state)
+            console.print()
+            console.print("  [muted]Fraction of feature-vector dimensions to perturb.[/muted]")
+            v = FloatPrompt.ask("  [accent]Dimension fraction (0.0 - 1.0)[/accent]", default=df_frac)
+            split_cfg["dim_fraction"] = max(0.0, min(1.0, v))
+            save_state(state)
 
         elif idx == 3:
-            # Just display — no action needed
+            menu_node_noise_layers(state, current_split)
+
+        elif idx == 4:
             if active:
-                info("Node noise is configured and will be applied during training.")
-                info("Training will use the Python API instead of the Chemprop CLI.")
+                info(f"Node noise is configured for {current_split}.")
             else:
                 info("Set both fractions > 0 and add at least one noise layer to activate.")
             pause()
 
-        elif idx == 4:
-            nn["node_fraction"] = 0.0
-            nn["dim_fraction"] = 0.0
-            nn["layers"] = []
+        elif idx == 5:
+            state["node_noise"] = {}
             save_state(state)
-            success("Node noise settings cleared.")
+            success("All Node noise settings cleared.")
             pause()
 
 
-def menu_node_noise_layers(state: dict):
+def menu_node_noise_layers(state: dict, current_split: str):
     """Manage the stackable noise layers for node features."""
-    nn = state["node_noise"]
-    layers = nn.setdefault("layers", [])
+    split_cfg = state["node_noise"].setdefault(current_split, {})
+    layers = split_cfg.setdefault("layers", [])
 
     while True:
         clear()
         banner()
-        section("Node Noise Layers")
+        section(f"Node Noise Layers ({current_split})")
 
         opts = []
         for i, layer in enumerate(layers):

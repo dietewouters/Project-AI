@@ -59,6 +59,8 @@ def _build_objective(
     seed: int,
     hpo_epochs: int,
     search_space: dict,
+    disable_output_scaling: bool = False,
+    disable_input_scaling: bool = False,
 ):
     """Return an Optuna objective closure that trains and returns val_loss."""
 
@@ -69,7 +71,7 @@ def _build_objective(
 
     from chemprop.data import MoleculeDatapoint, MoleculeDataset, build_dataloader
     from chemprop.nn import BondMessagePassing, MeanAggregation, RegressionFFN
-    from chemprop.nn.transforms import UnscaleTransform
+    from chemprop.nn.transforms import ScaleTransform, UnscaleTransform
     from chemprop.models import MPNN
     from node_noise import NoisyMessagePassing
 
@@ -93,18 +95,28 @@ def _build_objective(
     train_ds = _csv_to_dataset(train_csv)
     val_ds   = _csv_to_dataset(val_csv)
 
-    # Scaling
-    train_targets = np.array([dp.y for dp in train_ds])
-    mean_val = float(np.nanmean(train_targets))
-    std_val  = float(np.nanstd(train_targets))
-    if std_val == 0:
-        std_val = 1.0
+    # Target scaling
+    output_scaler = None
+    if not disable_output_scaling:
+        train_targets = np.array([dp.y for dp in train_ds])
+        mean_val = float(np.nanmean(train_targets))
+        std_val  = float(np.nanstd(train_targets))
+        if std_val == 0:
+            std_val = 1.0
 
-    scaler = StandardScaler()
-    scaler.mean_  = np.array([mean_val])
-    scaler.scale_ = np.array([std_val])
-    scaler.var_   = np.array([std_val ** 2])
-    scaler.n_features_in_ = 1
+        scaler = StandardScaler()
+        scaler.mean_  = np.array([mean_val])
+        scaler.scale_ = np.array([std_val])
+        scaler.var_   = np.array([std_val ** 2])
+        scaler.n_features_in_ = 1
+        output_scaler = scaler
+
+    # Input descriptor scaling
+    X_d_transform = None
+    if descriptor_columns and not disable_input_scaling:
+        xd_scaler = train_ds.normalize_inputs("X_d")
+        val_ds.normalize_inputs("X_d", scaler=xd_scaler)
+        X_d_transform = ScaleTransform.from_standard_scaler(xd_scaler)
 
     d_xd = len(descriptor_columns) if descriptor_columns else 0
     sp = search_space  # alias
@@ -129,7 +141,11 @@ def _build_objective(
         if final_lr > max_lr:
             final_lr = init_lr
 
-        output_transform = UnscaleTransform.from_standard_scaler(scaler)
+        output_transform = (
+            UnscaleTransform.from_standard_scaler(output_scaler)
+            if output_scaler is not None
+            else None
+        )
 
         # Build model
         mp = BondMessagePassing(d_v=72, d_e=14, d_h=d_h, depth=depth, dropout=dropout)
@@ -159,6 +175,7 @@ def _build_objective(
             init_lr=init_lr,
             max_lr=max_lr,
             final_lr=final_lr,
+            X_d_transform=X_d_transform,
         )
 
         train_loader = build_dataloader(train_ds, batch_size=bs, num_workers=0, shuffle=True, seed=seed)
@@ -208,6 +225,8 @@ def run_hpo(
     hpo_epochs: int = 10,
     search_space: dict | None = None,
     save_dir: str | None = None,
+    disable_output_scaling: bool = False,
+    disable_input_scaling: bool = False,
 ) -> dict:
     """
     Run Optuna hyperparameter search and return the best parameters.
@@ -253,6 +272,8 @@ def run_hpo(
         seed=seed,
         hpo_epochs=hpo_epochs,
         search_space=sp,
+        disable_output_scaling=disable_output_scaling,
+        disable_input_scaling=disable_input_scaling,
     )
 
     # Storage
