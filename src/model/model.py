@@ -8,7 +8,7 @@ from config import config
 class MLP(nn.Module):
     def __init__(
         self,
-        input_dim: int = config["input_dim"],       # 2048 fingerprint bits + 1 noisy value
+        input_dim: int = config["input_dim"],       
         hidden_dims: list = config["hidden_dims"],
         dropout: float = config["dropout"],
     ):
@@ -33,3 +33,8 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.network(x).squeeze(1)  # shape (batch_size,)
 
+class MLPDelta(MLP):
+    def predict(self, x):
+        delta = self.network(x).squeeze(1)
+        noisy = x[:, -1]
+        return noisy - delta  # Subtract delta (error) from noisy to predict the true value

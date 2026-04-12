@@ -2,9 +2,9 @@
 import torch
 import torch.nn as nn
 
-from model import MLP
-from evaluate import evaluate
-from data_loader import get_dataloaders
+from model.model import MLP
+from model.evaluate import evaluate
+from model.data_loader import get_dataloaders
 
 def train_one_epoch(model, loader, optimizer, criterion, device, delta = False) -> float:
     model.train()
@@ -45,7 +45,7 @@ import torch
 console = Console()
 
 
-def train(model, loaders, config, device, optimizer=None, criterion=None) -> tuple:
+def train(model, loaders, config, device, optimizer=None, criterion=None, delta=False) -> tuple:
     model.to(device)
 
     if optimizer is None:
@@ -73,8 +73,8 @@ def train(model, loaders, config, device, optimizer=None, criterion=None) -> tup
         task = progress.add_task("[cyan]Training...", total=config['epochs'])
 
         for epoch in range(config['epochs']):
-            train_loss = train_one_epoch(model, loaders['train'], optimizer, criterion, device)
-            val_loss = evaluate(model, loaders['val'], criterion, device)
+            train_loss = train_one_epoch(model, loaders['train'], optimizer, criterion, device, delta=delta)
+            val_loss = evaluate(model, loaders['val'], criterion, device, delta=delta)
 
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
