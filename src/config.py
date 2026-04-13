@@ -7,7 +7,8 @@ config = {
             "input_dim" : 1025,
             "hidden_dims" : [512, 256, 128, 64],
             "dropout" : 0.2,
-            "activation_function" : GELU, 
+            "activation_function" : "GELU", 
+            "delta": False,
 
             # Training Parameters
             "lr" : 0.001,
@@ -15,7 +16,7 @@ config = {
             "epochs" : 20,
             "optimizer" : "adam",
             "weight_decay" : 1e-5,
-            "patience" : 10,
+            "patience" : 5,
             "num_workers" : 0,
 
             # Data Paths

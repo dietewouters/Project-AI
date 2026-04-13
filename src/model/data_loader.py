@@ -109,11 +109,6 @@ class DynamicMoleculeDataset(Dataset):
             
         return fp, noisy, y_true
 
-class DynamicMoleculeDatasetDelta(DynamicMoleculeDataset):
-    def _get_items(self, idx):
-        fp, noisy, y_true = super()._get_items(idx)
-        y_delta = noisy - y_true.unsqueeze(0)
-        return fp, noisy, y_true, y_delta
 
 class DynamicMoleculeDatasetKNN(DynamicMoleculeDataset):
     def __init__(self, dataset_config, k: int = 5, features_dir='data/processed_features'):
@@ -138,11 +133,10 @@ class CloudMoleculeDataset(Dataset):
     A lightweight detached dataset that purely consumes pre-extracted Tensors.
     This completely bypasses pandas, CSVs, and .npz parsing for Cloud/Kaggle environments.
     """
-    def __init__(self, tensor_dict, delta=False):
+    def __init__(self, tensor_dict):
         self.fp = tensor_dict["fp"]
         self.noisy = tensor_dict["noisy"]
         self.y_true = tensor_dict["y_true"]
-        self.delta = delta
 
     def __len__(self):
         return len(self.fp)
@@ -151,14 +145,9 @@ class CloudMoleculeDataset(Dataset):
         fp = self.fp[idx]
         noisy = self.noisy[idx]
         y_true = self.y_true[idx]
-        
-        if self.delta:
-            y_delta = noisy - y_true.unsqueeze(0)
-            return fp, noisy, y_true, y_delta
-            
         return fp, noisy, y_true
 
-def export_to_cloud_bundle(loaders, export_path, delta=False):
+def export_to_cloud_bundle(loaders, export_path):
     """ Extracts base PyTorch tensors from instantiated datasets and seals them in a single .pt """
     import os
     os.makedirs(os.path.dirname(export_path), exist_ok=True)
@@ -171,16 +160,15 @@ def export_to_cloud_bundle(loaders, export_path, delta=False):
             "noisy": ds.noisy if ds.noisy is not None else ds.clean_target_for_noise, # Simplified logic if pre-generated
             "y_true": ds.y_true
         }
-    bundle["metadata"] = {"delta": delta}
     torch.save(bundle, export_path)
 
-def get_dataloaders(loaders_config, features_dir='data/processed_features', delta=False):
+def get_dataloaders(loaders_config, features_dir='data/processed_features'):
     """
     loaders_config: dict with 'train', 'val', 'test' keys.
     Each contains a dataset_config dictionary compatible with DynamicMoleculeDataset.
     """
     datasets = {}
-    dataset_class = DynamicMoleculeDatasetDelta if delta else DynamicMoleculeDataset
+    dataset_class = DynamicMoleculeDataset
     
     for split in ["train", "val", "test"]:
         if split in loaders_config:
@@ -194,30 +182,25 @@ def get_dataloaders(loaders_config, features_dir='data/processed_features', delt
             
     return loaders
 
-def get_cloud_dataloaders(bundle_path, delta=None):
+def get_cloud_dataloaders(bundle_path):
     """
     Instantiates DataLoader objects directly off a pre-extracted Kaggle/Cloud .pt payload
     """
     bundle = torch.load(bundle_path)
-    
-    if delta is None:
-        delta = False
-        if "metadata" in bundle:
-            delta = bundle["metadata"].get("delta", False)
         
     datasets = {}
     for split, tensor_dict in bundle.items():
         if split == "metadata":
             continue
         print(f"  [+] Unpacking Cloud payload block -> {split.upper()}")
-        datasets[split] = CloudMoleculeDataset(tensor_dict, delta=delta)
+        datasets[split] = CloudMoleculeDataset(tensor_dict)
         
     loaders = {}
     for split in ["train", "val", "test"]:
         if split in datasets:
             loaders[split] = DataLoader(datasets[split], batch_size=config.get("batch_size", 64), shuffle=(split=="train"), num_workers=config.get("num_workers", 0))
             
-    return loaders, delta
+    return loaders
 
 def main():
     dataset_path = 'data/groupadditivity_h298/dataset/groupadditivity_0.004.csv'
@@ -235,13 +218,12 @@ def main():
         print(f"Total samples: {len(ds)}")
         
         # Grab the first item (index 0)
-        # Based on your class, this returns: fp, noisy, y_delta, y_true
-        sample_fp, sample_noisy, sample_delta, sample_true = ds[0]
+        # Based on your class, this returns: fp, noisy, y_true
+        sample_fp, sample_noisy, sample_true = ds[0]
         
         print(f"Fingerprint shape: {sample_fp.shape}")
         print(f"Fingerprint (first 10 bits): {sample_fp[:10]}")
         print(f"Noisy Input (Scaled): {sample_noisy.item():.4f}")
-        print(f"Target Delta (Label): {sample_delta.item():.4f}")
         print(f"True h298: {sample_true.item():.4f}")
         
         # Verify the Delta math: Noisy - True = Delta

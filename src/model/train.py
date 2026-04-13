@@ -14,34 +14,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device, delta = False, 
     if progress is not None:
         batch_task = progress.add_task("[magenta]Processing Batches...", total=len(loader))
         
-    if delta:
-        for fp, noisy, _, y_delta in loader:
-            X = torch.cat([fp, noisy], dim=1).to(device)
-            y = y_delta.to(device)
-
-            optimizer.zero_grad()
-            predictions = model(X)
-            loss = criterion(predictions, y)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item() * len(y)
-            if progress is not None and batch_task is not None:
-                progress.update(batch_task, advance=1)
-    else:
-        for fp, noisy, y_true in loader:
-            X = torch.cat([fp, noisy], dim=1).to(device)
+    for fp, noisy, y_true in loader:
+        X = torch.cat([fp, noisy], dim=1).to(device)
+        if delta:
+            y = (noisy.squeeze(1) - y_true).to(device)
+        else:
             y = y_true.to(device)
 
-            optimizer.zero_grad()
-            predictions = model(X)
-            loss = criterion(predictions, y)
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        predictions = model(X)
+        loss = criterion(predictions.view(-1), y.view(-1))
+        loss.backward()
+        optimizer.step()
 
-            total_loss += loss.item() * len(y)
-            if progress is not None and batch_task is not None:
-                progress.update(batch_task, advance=1)
+        total_loss += loss.item() * len(y)
+        if progress is not None and batch_task is not None:
+            progress.update(batch_task, advance=1)
                 
     if progress is not None and batch_task is not None:
         progress.remove_task(batch_task)

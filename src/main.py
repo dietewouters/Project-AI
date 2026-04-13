@@ -7,7 +7,7 @@ from rich.console import Console
 from rich.prompt import Prompt, Confirm, IntPrompt, FloatPrompt
 import questionary
 from model.data_loader import get_dataloaders
-from model.model import MLP
+from model.model import MLP, MLPDelta
 from config import config
 from model.train import train
 # from optimize import run_optimization
@@ -241,7 +241,7 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
             loaders_config = interactive_setup(data_dir, splits=["test"])
             
         console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
-        loaders = get_dataloaders(loaders_config, delta=delta)
+        loaders = get_dataloaders(loaders_config)
         
         if "test" not in loaders:
             console.print("[red]Test DataLoader could not be built. Aborting test.[/red]")
@@ -289,11 +289,11 @@ def main():
         delta_choice = False
         
         if args.cloud_bundle:
-            l1, delta_choice = get_cloud_dataloaders(args.cloud_bundle, delta=None)
+            l1 = get_cloud_dataloaders(args.cloud_bundle)
             loaders.update(l1)
             
         if args.test_bundle:
-            l2, delta_choice = get_cloud_dataloaders(args.test_bundle, delta=None)
+            l2 = get_cloud_dataloaders(args.test_bundle)
             loaders.update(l2)
             
         loaders_config = {"test": True} if "test" in loaders else {} # Mock configuration presence
@@ -338,13 +338,13 @@ def main():
                 else:
                     chosen_bundle = questionary.select("Choose a dataset bundle:", choices=bundle_files).ask()
                     from model.data_loader import get_cloud_dataloaders
-                    l1, _ = get_cloud_dataloaders(chosen_bundle, delta=delta_choice)
+                    l1 = get_cloud_dataloaders(chosen_bundle)
                     loaders.update(l1)
                     
             if not use_ready_loader:
                 loaders_config = interactive_setup(DATA_DIR, splits=["test"])
                 console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
-                loaders = get_dataloaders(loaders_config, delta=delta_choice)
+                loaders = get_dataloaders(loaders_config)
                 
             # If the user chose a training bundle to evaluate training loss, we capture the best available loader
             test_loader = loaders.get("test") or loaders.get("val") or loaders.get("train")
@@ -363,14 +363,12 @@ def main():
                 run_config = config
                 
             if delta_choice:
-                from model.model import MLPDelta
                 model = MLPDelta(
                     input_dim=run_config["input_dim"],
                     hidden_dims=run_config["hidden_dims"],
                     dropout=run_config["dropout"],
                 ).to(device)
             else:
-                from model.model import MLP
                 model = MLP(
                     input_dim=run_config["input_dim"],
                     hidden_dims=run_config["hidden_dims"],
@@ -413,7 +411,7 @@ def main():
                 ).ask()
                 
                 from model.data_loader import get_cloud_dataloaders
-                l1, _ = get_cloud_dataloaders(chosen_bundle, delta=delta_choice)
+                l1 = get_cloud_dataloaders(chosen_bundle)
                 loaders.update(l1)
                 loaders_config = {"test": True} if "test" in loaders else {}
                 
@@ -425,7 +423,7 @@ def main():
             console.print("\n[bold cyan]Loading Datasets...[/bold cyan]")
             
             # Retrieve pre-constructed dataloaders based on the wizard settings
-            loaders = get_dataloaders(loaders_config, delta=delta_choice)
+            loaders = get_dataloaders(loaders_config)
             print("OK Dataloaders")
             
             action_choice = questionary.select(
@@ -444,13 +442,17 @@ def main():
                 test_loaders = {k: v for k, v in loaders.items() if k == "test"}
                 
                 if train_val_loaders:
-                    export_path_train = os.path.join("results", "cloud_datasets", f"kaggle_train_val_{timestamp}.pt")
-                    export_to_cloud_bundle(train_val_loaders, export_path_train, delta=delta_choice)
+                    custom_train_name = questionary.text("Enter a name for the Train/Val dataset bundle (leave blank for timestamp):").ask()
+                    bundle_tr_name = custom_train_name if custom_train_name else f"kaggle_train_val_{timestamp}"
+                    export_path_train = os.path.join("results", "cloud_datasets", f"{bundle_tr_name}.pt")
+                    export_to_cloud_bundle(train_val_loaders, export_path_train)
                     console.print(f"[bold green]✔ Train/Val Dataset successfully sealed at:[/bold green] {export_path_train}")
                     
                 if test_loaders:
-                    export_path_test = os.path.join("results", "cloud_datasets", f"kaggle_test_{timestamp}.pt")
-                    export_to_cloud_bundle(test_loaders, export_path_test, delta=delta_choice)
+                    custom_test_name = questionary.text("Enter a name for the Test dataset bundle (leave blank for timestamp):").ask()
+                    bundle_te_name = custom_test_name if custom_test_name else f"kaggle_test_{timestamp}"
+                    export_path_test = os.path.join("results", "cloud_datasets", f"{bundle_te_name}.pt")
+                    export_to_cloud_bundle(test_loaders, export_path_test)
                     console.print(f"[bold green]✔ Test Dataset successfully sealed at:[/bold green] {export_path_test}")
                 
                 if action_choice == "Export to Cloud (.pt)":
@@ -459,7 +461,6 @@ def main():
 
     # Final model setup
     if delta_choice:
-        from model.model import MLPDelta
         model = MLPDelta(
             input_dim=config["input_dim"],
             hidden_dims=config["hidden_dims"],
@@ -481,7 +482,12 @@ def main():
         import time, json
         delta_str = "delta" if delta_choice else "nodelta"
         timestamp = int(time.time())
-        base_name = f"MLP_{delta_str}_{timestamp}"
+        default_base_name = f"MLP_{delta_str}_{timestamp}"
+        
+        custom_base_name = questionary.text(f"Enter a base name for the model results (leave blank for: {default_base_name}):").ask()
+        base_name = custom_base_name if custom_base_name else default_base_name
+        
+        config["delta"] = delta_choice
         
         models_dir = os.path.join("results", "models")
         histories_dir = os.path.join("results", "histories")
