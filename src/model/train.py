@@ -6,9 +6,14 @@ from model.model import MLP
 from model.evaluate import evaluate
 from model.data_loader import get_dataloaders
 
-def train_one_epoch(model, loader, optimizer, criterion, device, delta = False) -> float:
+def train_one_epoch(model, loader, optimizer, criterion, device, delta = False, progress=None) -> float:
     model.train()
     total_loss = 0.0
+    
+    batch_task = None
+    if progress is not None:
+        batch_task = progress.add_task("[magenta]Processing Batches...", total=len(loader))
+        
     if delta:
         for fp, noisy, _, y_delta in loader:
             X = torch.cat([fp, noisy], dim=1).to(device)
@@ -21,7 +26,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, delta = False) 
             optimizer.step()
 
             total_loss += loss.item() * len(y)
-        return total_loss / len(loader.dataset)
+            if progress is not None and batch_task is not None:
+                progress.update(batch_task, advance=1)
     else:
         for fp, noisy, y_true in loader:
             X = torch.cat([fp, noisy], dim=1).to(device)
@@ -34,7 +40,13 @@ def train_one_epoch(model, loader, optimizer, criterion, device, delta = False) 
             optimizer.step()
 
             total_loss += loss.item() * len(y)
-        return total_loss / len(loader.dataset)
+            if progress is not None and batch_task is not None:
+                progress.update(batch_task, advance=1)
+                
+    if progress is not None and batch_task is not None:
+        progress.remove_task(batch_task)
+        
+    return total_loss / len(loader.dataset)
 
 
 from rich.console import Console
@@ -73,7 +85,7 @@ def train(model, loaders, config, device, optimizer=None, criterion=None, delta=
         task = progress.add_task("[cyan]Training...", total=config['epochs'])
 
         for epoch in range(config['epochs']):
-            train_loss = train_one_epoch(model, loaders['train'], optimizer, criterion, device, delta=delta)
+            train_loss = train_one_epoch(model, loaders['train'], optimizer, criterion, device, delta=delta, progress=progress)
             val_loss = evaluate(model, loaders['val'], criterion, device, delta=delta)
 
             history['train_loss'].append(train_loss)

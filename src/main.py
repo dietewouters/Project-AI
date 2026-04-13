@@ -224,7 +224,7 @@ def interactive_setup(data_dir: str, splits=None):
             
     return loaders_config
 
-def test_model(model, data_dir, loaders_config=None, device=None, delta=False, base_name=None):
+def test_model(model, data_dir, loaders_config=None, test_loader=None, device=None, delta=False, base_name=None):
     """
     Dedicated function for testing a trained model.
     Pass a loaders_config with 'test' defined, or it will launch the setup wizard.
@@ -235,18 +235,20 @@ def test_model(model, data_dir, loaders_config=None, device=None, delta=False, b
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-    if loaders_config is None or "test" not in loaders_config:
-        console.print("\n[bold yellow]No test configuration passed. Launching Wizard...[/bold yellow]")
-        loaders_config = interactive_setup(data_dir, splits=["test"])
+    if test_loader is None:
+        if loaders_config is None or "test" not in loaders_config:
+            console.print("\n[bold yellow]No test configuration passed. Launching Wizard...[/bold yellow]")
+            loaders_config = interactive_setup(data_dir, splits=["test"])
+            
+        console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
+        loaders = get_dataloaders(loaders_config, delta=delta)
         
-    console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
-    loaders = get_dataloaders(loaders_config, delta=delta)
-    
-    if "test" not in loaders:
-        console.print("[red]Test DataLoader could not be built. Aborting test.[/red]")
-        return None
+        if "test" not in loaders:
+            console.print("[red]Test DataLoader could not be built. Aborting test.[/red]")
+            return None
+            
+        test_loader = loaders["test"]
         
-    test_loader = loaders["test"]
     criterion = nn.MSELoss() # Update this if your test function relies on another default
     
     console.print("\n[bold cyan]--- Running Test Evaluation ---[/bold cyan]")
@@ -287,11 +289,11 @@ def main():
         delta_choice = False
         
         if args.cloud_bundle:
-            l1, delta_choice = get_cloud_dataloaders(args.cloud_bundle)
+            l1, delta_choice = get_cloud_dataloaders(args.cloud_bundle, delta=None)
             loaders.update(l1)
             
         if args.test_bundle:
-            l2, delta_choice = get_cloud_dataloaders(args.test_bundle)
+            l2, delta_choice = get_cloud_dataloaders(args.test_bundle, delta=None)
             loaders.update(l2)
             
         loaders_config = {"test": True} if "test" in loaders else {} # Mock configuration presence
@@ -303,9 +305,97 @@ def main():
              console.print("[yellow]Only Test Bundle Provided! (Please ensure you implement specific weight loading if you intended to do so later!)[/yellow]")
         
     # ---------------- INTERACTIVE LOCAL BOOT ---------------- #
+    # ---------------- INTERACTIVE LOCAL BOOT ---------------- #
     else:
-        console.print("\n[bold magenta]--- General Training Config ---[/bold magenta]")
+        console.print("\n[bold magenta]--- General Execution Mode ---[/bold magenta]")
         import questionary
+        
+        exec_mode = questionary.select(
+            "What would you like to do?",
+            choices=["Train a New Model", "Test an Existing Model"]
+        ).ask()
+        
+        if exec_mode == "Test an Existing Model":
+            model_files = glob.glob(os.path.join("results", "models", "*.pth"))
+            if not model_files:
+                console.print("[red]No trained models found in results/models/ ![/red]")
+                return
+            chosen_model_path = questionary.select("Select a trained model to evaluate:", choices=model_files).ask()
+            
+            delta_choice = questionary.confirm("Are we performing Delta Evaluation (predicting noise differences)?", default=False).ask()
+            
+            console.print("\n[bold magenta]--- Test Dataset Config ---[/bold magenta]")
+            use_ready_loader = questionary.confirm("Provide testing dataset from an already ready bundle (.pt)?", default=False).ask()
+            
+            loaders = {}
+            loaders_config = {}
+            
+            if use_ready_loader:
+                bundle_files = glob.glob(os.path.join("results", "cloud_datasets", "*.pt"))
+                if not bundle_files:
+                    console.print("[yellow]No '.pt' bundles found. Falling back to manual setup.[/yellow]")
+                    use_ready_loader = False
+                else:
+                    chosen_bundle = questionary.select("Choose a dataset bundle:", choices=bundle_files).ask()
+                    from model.data_loader import get_cloud_dataloaders
+                    l1, _ = get_cloud_dataloaders(chosen_bundle, delta=delta_choice)
+                    loaders.update(l1)
+                    
+            if not use_ready_loader:
+                loaders_config = interactive_setup(DATA_DIR, splits=["test"])
+                console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
+                loaders = get_dataloaders(loaders_config, delta=delta_choice)
+                
+            # If the user chose a training bundle to evaluate training loss, we capture the best available loader
+            test_loader = loaders.get("test") or loaders.get("val") or loaders.get("train")
+            
+            if test_loader is None:
+                console.print("[red]Test DataLoader could not be generated. Aborting.[/red]")
+                return
+
+            import json
+            base = os.path.basename(chosen_model_path).replace(".pth", "")
+            base_config = os.path.join("results", "configs", f"{base}_config.json")
+            if os.path.exists(base_config):
+                with open(base_config, 'r') as f:
+                    run_config = json.load(f)
+            else:
+                run_config = config
+                
+            if delta_choice:
+                from model.model import MLPDelta
+                model = MLPDelta(
+                    input_dim=run_config["input_dim"],
+                    hidden_dims=run_config["hidden_dims"],
+                    dropout=run_config["dropout"],
+                ).to(device)
+            else:
+                from model.model import MLP
+                model = MLP(
+                    input_dim=run_config["input_dim"],
+                    hidden_dims=run_config["hidden_dims"],
+                    dropout=run_config["dropout"],
+                ).to(device)
+                
+            model.load_state_dict(torch.load(chosen_model_path, map_location=device, weights_only=True))
+            
+            test_model(
+                model, 
+                DATA_DIR, 
+                loaders_config=loaders_config, 
+                test_loader=test_loader, 
+                device=device, 
+                delta=delta_choice,
+                base_name=base
+            )
+            return
+
+        # ==========================================
+        # TRAIN A NEW MODEL
+        # ==========================================
+        console.print("\n[bold magenta]--- New Model Training Config ---[/bold magenta]")
+        
+        delta_choice = questionary.confirm("Are we performing Delta Training (predicting noise differences)?", default=False).ask()
         
         use_ready_loader = questionary.confirm("Train locally with an already ready data loader bundle (.pt)?", default=False).ask()
         
@@ -323,12 +413,11 @@ def main():
                 ).ask()
                 
                 from model.data_loader import get_cloud_dataloaders
-                l1, delta_choice = get_cloud_dataloaders(chosen_bundle)
+                l1, _ = get_cloud_dataloaders(chosen_bundle, delta=delta_choice)
                 loaders.update(l1)
                 loaders_config = {"test": True} if "test" in loaders else {}
                 
         if not use_ready_loader:
-            delta_choice = questionary.confirm("Are we performing Delta Training (predicting noise differences)?", default=False).ask()
             
             # Run the interactive setup wizard for train & val
             loaders_config = interactive_setup(DATA_DIR)
@@ -433,11 +522,12 @@ def main():
         console.print(f"[bold green]✔ Curve Plotted safely to:[/bold green] {plot_path}\n")
         
     # Execute Test Phase if explicitly requested
-    if "test" in loaders_config:
+    if "test" in loaders_config or "test" in loaders:
         test_model(
             model, 
             DATA_DIR, 
-            loaders_config, 
+            loaders_config=loaders_config, 
+            test_loader=loaders.get("test"), 
             device=device, 
             delta=delta_choice if 'delta_choice' in locals() else False,
             base_name=base_name if 'base_name' in locals() else None

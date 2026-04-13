@@ -194,14 +194,16 @@ def get_dataloaders(loaders_config, features_dir='data/processed_features', delt
             
     return loaders
 
-def get_cloud_dataloaders(bundle_path, delta=False):
+def get_cloud_dataloaders(bundle_path, delta=None):
     """
     Instantiates DataLoader objects directly off a pre-extracted Kaggle/Cloud .pt payload
     """
     bundle = torch.load(bundle_path)
     
-    if "metadata" in bundle:
-        delta = bundle["metadata"].get("delta", delta)
+    if delta is None:
+        delta = False
+        if "metadata" in bundle:
+            delta = bundle["metadata"].get("delta", False)
         
     datasets = {}
     for split, tensor_dict in bundle.items():
