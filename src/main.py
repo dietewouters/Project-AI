@@ -10,6 +10,7 @@ from model.data_loader import get_dataloaders
 from model.model import MLP, MLPDelta
 from config import config
 from model.train import train
+from model.data_loader_scaled import get_dataloaders_scaled
 # from optimize import run_optimization
 
 console = Console()
@@ -224,7 +225,7 @@ def interactive_setup(data_dir: str, splits=None):
             
     return loaders_config
 
-def test_model(model, data_dir, loaders_config=None, test_loader=None, device=None, delta=False, base_name=None):
+def test_model(model, data_dir, loaders_config=None, test_loader=None, device=None, delta=False, base_name=None, target_scaler=None):
     """
     Dedicated function for testing a trained model.
     Pass a loaders_config with 'test' defined, or it will launch the setup wizard.
@@ -239,20 +240,35 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
         if loaders_config is None or "test" not in loaders_config:
             console.print("\n[bold yellow]No test configuration passed. Launching Wizard...[/bold yellow]")
             loaders_config = interactive_setup(data_dir, splits=["test"])
-            
+
         console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
-        loaders = get_dataloaders(loaders_config)
-        
+
+        scaling_type = None
+        if "test" in loaders_config:
+            scaling_type = loaders_config["test"].get("scaling", "none")
+
+        if scaling_type == "none":
+            loaders = get_dataloaders(loaders_config)
+        else:
+            loaders, target_scaler = get_dataloaders_scaled(loaders_config)
+
         if "test" not in loaders:
             console.print("[red]Test DataLoader could not be built. Aborting test.[/red]")
             return None
-            
+
         test_loader = loaders["test"]
         
     criterion = nn.MSELoss() # Update this if your test function relies on another default
     
     console.print("\n[bold cyan]--- Running Test Evaluation ---[/bold cyan]")
-    test_loss = test(model, test_loader, criterion, device, delta=delta)
+    test_loss = test(
+    model,
+    test_loader,
+    criterion,
+    device,
+    delta=delta,
+    target_scaler=target_scaler
+)
     console.print(f"[bold green]Final Test Loss:[/bold green] {test_loss:.6f}\n")
     
     if not base_name:
@@ -278,6 +294,7 @@ def main():
     
     DATA_DIR = config["data_path"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    target_scaler = None
     
     # ---------------- HEADLESS KAGGLE BOOT ---------------- #
     if args.cloud_bundle or args.test_bundle:
@@ -381,10 +398,11 @@ def main():
                 model, 
                 DATA_DIR, 
                 loaders_config=loaders_config, 
-                test_loader=test_loader, 
+                test_loader=loaders.get("test"), 
                 device=device, 
                 delta=delta_choice,
-                base_name=base
+                base_name=base_name,
+                target_scaler=target_scaler
             )
             return
 
@@ -396,6 +414,15 @@ def main():
         delta_choice = questionary.confirm("Are we performing Delta Training (predicting noise differences)?", default=False).ask()
         
         use_ready_loader = questionary.confirm("Train locally with an already ready data loader bundle (.pt)?", default=False).ask()
+        
+        scaling_type = questionary.select(
+        "Which scaling do you want to use for enthalpy values?",
+        choices=[
+            "none",
+            "standard",
+            "minmax"
+            ]
+        ).ask()
         
         loaders = {}
         
@@ -414,16 +441,25 @@ def main():
                 l1 = get_cloud_dataloaders(chosen_bundle)
                 loaders.update(l1)
                 loaders_config = {"test": True} if "test" in loaders else {}
+                target_scaler = None
                 
         if not use_ready_loader:
-            
+    
             # Run the interactive setup wizard for train & val
             loaders_config = interactive_setup(DATA_DIR)
-        
+
             console.print("\n[bold cyan]Loading Datasets...[/bold cyan]")
-            
-            # Retrieve pre-constructed dataloaders based on the wizard settings
-            loaders = get_dataloaders(loaders_config)
+
+            if scaling_type == "none":
+                loaders = get_dataloaders(loaders_config)
+                target_scaler = None
+            else:
+                for split in ["train", "val", "test"]:
+                    if split in loaders_config:
+                        loaders_config[split]["scaling"] = scaling_type
+
+                loaders, target_scaler = get_dataloaders_scaled(loaders_config)
+
             print("OK Dataloaders")
             
             action_choice = questionary.select(
@@ -475,7 +511,14 @@ def main():
 
     # Train model if training splits are present
     if "train" in loaders and "val" in loaders:
-        model, history = train(model, loaders, config, device, delta=delta_choice)
+        model, history = train(
+            model,
+            loaders,
+            config,
+            device,
+            delta=delta_choice,
+            target_scaler=target_scaler
+        )
         plot_history(history)
         
         # Save Model and History automatically
@@ -536,7 +579,8 @@ def main():
             test_loader=loaders.get("test"), 
             device=device, 
             delta=delta_choice if 'delta_choice' in locals() else False,
-            base_name=base_name if 'base_name' in locals() else None
+            base_name=base_name if 'base_name' in locals() else None,
+            target_scaler=target_scaler
         )
 
 if __name__ == "__main__":
