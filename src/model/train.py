@@ -93,7 +93,7 @@ def train(model, loaders, config, device, optimizer=None, criterion=None, delta=
     if criterion is None:
         criterion = nn.MSELoss()
 
-    history = {"train_loss": [], "val_loss": []}
+    history = {"train_loss": [], "val_loss": [], "train_eval_loss": []}
     best_val_loss = float("inf")
     best_model_state = None
     patience_counter = 0
@@ -134,9 +134,19 @@ def train(model, loaders, config, device, optimizer=None, criterion=None, delta=
                 delta=delta,
                 target_scaler=target_scaler
             )
+            
+            train_eval_loss = evaluate(
+                model,
+                loaders['train'],
+                criterion,
+                device,
+                delta=delta,
+                target_scaler=target_scaler
+            )
 
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
+            history['train_eval_loss'].append(train_eval_loss)
 
             train_color = "green" if epoch == 0 or train_loss < history['train_loss'][-2] else "red"
             val_color = "green" if val_loss < best_val_loss else "red"
@@ -145,8 +155,9 @@ def train(model, loaders, config, device, optimizer=None, criterion=None, delta=
 
             console.print(
                 f"Epoch [bold cyan]{epoch + 1:3d}/{config['epochs']}[/bold cyan] | "
-                f"Train Loss: [{train_color}]{train_loss:.6f}[/{train_color}] | "
-                f"Val Loss: [{val_color}]{val_loss:.6f}[/{val_color}]",
+                f"Train: {train_loss:.6f} | "
+                f"Train(eval): {train_eval_loss:.6f} | "
+                f"Val: {val_loss:.6f}",
                 end=""
             )
 

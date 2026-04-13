@@ -18,6 +18,16 @@ console = Console()
 def plot_history(history: dict):
     plt.plot(history["train_loss"], label="Train Loss")
     plt.plot(history["val_loss"], label="Val Loss")
+    plt.plot(history["train_eval_loss"], label="Train Loss at end of epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training History")
+    plt.legend()
+    plt.show()
+
+def plot_history2(history: dict):
+    plt.plot(history["val_loss"], label="Val Loss")
+    plt.plot(history["train_eval_loss"], label="Train Loss at end of epoch")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training History")
@@ -249,6 +259,8 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
 
         if scaling_type == "none":
             loaders = get_dataloaders(loaders_config)
+            train_names = set(loaders['train'].dataset.names)
+
         else:
             loaders, target_scaler = get_dataloaders_scaled(loaders_config)
 
@@ -453,6 +465,12 @@ def main():
             if scaling_type == "none":
                 loaders = get_dataloaders(loaders_config)
                 target_scaler = None
+                train_names = set(loaders['train'].dataset.names)
+                val_names = set(loaders['val'].dataset.names)
+
+                overlap = train_names.intersection(val_names)
+
+                print(f"\n[DEBUG] Overlap train-val molecules: {len(overlap)}")
             else:
                 for split in ["train", "val", "test"]:
                     if split in loaders_config:
@@ -520,6 +538,7 @@ def main():
             target_scaler=target_scaler
         )
         plot_history(history)
+        plot_history2(history)
         
         # Save Model and History automatically
         import time, json
