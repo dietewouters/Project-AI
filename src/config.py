@@ -1,11 +1,13 @@
 # All hyperparameters and constants
 import os
+from torch.nn import ReLU, GELU, SiLU, LeakyReLU, ELU
 
 config = {
             # Model Parameters
             "input_dim" : 1025,
             "hidden_dims" : [512, 256, 128, 64],
             "dropout" : 0.2,
+            "activation_function" : GELU, 
 
             # Training Parameters
             "lr" : 0.001,

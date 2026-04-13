@@ -229,7 +229,7 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
     Dedicated function for testing a trained model.
     Pass a loaders_config with 'test' defined, or it will launch the setup wizard.
     """
-    from model.evaluate import evaluate
+    from model.evaluate import test
     import torch.nn as nn
     
     if device is None:
@@ -252,7 +252,7 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
     criterion = nn.MSELoss() # Update this if your test function relies on another default
     
     console.print("\n[bold cyan]--- Running Test Evaluation ---[/bold cyan]")
-    test_loss = evaluate(model, test_loader, criterion, device, delta=delta)
+    test_loss = test(model, test_loader, criterion, device, delta=delta)
     console.print(f"[bold green]Final Test Loss:[/bold green] {test_loss:.6f}\n")
     
     if not base_name:
