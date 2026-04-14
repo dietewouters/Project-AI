@@ -1,18 +1,44 @@
 import os
 import glob
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from rich.console import Console
 from rich.prompt import Prompt, Confirm, IntPrompt, FloatPrompt
 import questionary
-from model.data_loader import get_dataloaders
+import time
+import json
+import re
+import argparse
+from model.data_loader import get_dataloaders, get_cloud_dataloaders, export_to_cloud_bundle
 from model.model import MLP, MLPDelta
 from config import config
 from model.train import train
-# from optimize import run_optimization
+from model.evaluate import test
+from utils.kaggle_gen import generate_kaggle_bundler, generate_kaggle_runner
 
 console = Console()
+
+def ask_with_default(msg, def_val):
+    """
+    Helper to ask a question with a default value shown in yellow parentheses.
+    Uses Rich for perfect styling and native input for absolute 'Enter key' reliability.
+    """
+    # Print the question with yellow parentheses using Rich
+    console.print(f"\n[bold white]?[/bold white] {msg} [yellow]({def_val})[/yellow]: ", end="")
+    
+    # Capture input natively - no ANSI symbols, no random brackets
+    try:
+        val = input().strip()
+    except EOFError:
+        return def_val
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user.[/yellow]")
+        raise
+        
+    # Return user input or the default fallback
+    return val if val else def_val
 
 def plot_history(history: dict):
     plt.plot(history["train_loss"], label="Train Loss")
@@ -30,20 +56,10 @@ def get_file_len(filepath):
             return sum(1 for _ in f) - 1
     return 0
 
-import re
-
-def get_file_len(filepath):
-    # Fast line counter skipping header
-    if os.path.exists(filepath):
-        with open(filepath, 'r') as f:
-            return sum(1 for _ in f) - 1
-    return 0
-
 def get_fraction_from_filename(filename):
     match = re.search(r'_([0-9]+\.[0-9]+)', filename)
     if match:
         return float(match.group(1))
-    # Check if integer 1 e.g. groupadditivity_1
     match_int = re.search(r'_1[_\.]', filename)
     if match_int:
         return 1.0
@@ -78,7 +94,6 @@ def interactive_setup(data_dir: str, splits=None):
         if split == "val" and "groupadditivity_secondarytest.csv" in available_targets: def_target = "groupadditivity_secondarytest.csv"
         if split == "test" and "groupadditivity_test.csv" in available_targets: def_target = "groupadditivity_test.csv"
         
-        # Menu selection with arrow keys
         target_name = questionary.select(
             f"Select Target Master Dictionary for {split.upper()}:",
             choices=available_targets,
@@ -92,7 +107,7 @@ def interactive_setup(data_dir: str, splits=None):
         indices_path = os.path.join(indices_dir, indices_filename)
         
         max_mols = get_file_len(target_path)
-        if max_mols <= 0: max_mols = 1000 # Test default
+        if max_mols <= 0: max_mols = 1000 
         
         total_molecules = IntPrompt.ask(f"How many total molecules to use? (Max: {max_mols})", default=max_mols)
         master_fraction_ratio = float(total_molecules) / max_mols if max_mols > 0 else 1.0
@@ -134,8 +149,7 @@ def interactive_setup(data_dir: str, splits=None):
                             if pct > remaining:
                                 pct = remaining
                             remaining -= pct
-                            
-                    # Required absolute fraction for this noise
+                    
                     req_fraction = master_fraction_ratio * pct
                     console.print(f"Targeting fraction ~{req_fraction:.3f} for noise '{d}'")
                     
@@ -145,7 +159,6 @@ def interactive_setup(data_dir: str, splits=None):
                     except FileNotFoundError:
                         avail_nf = []
                         
-                    # Filter files so we only pick noise blocks that actually match our target dictionary!
                     if "secondarytest" in target_name:
                         avail_nf = [f for f in avail_nf if "secondarytest" in f]
                     elif "test" in target_name:
@@ -153,15 +166,11 @@ def interactive_setup(data_dir: str, splits=None):
                     else:
                         avail_nf = [f for f in avail_nf if "test" not in f]
                         
-                    # Filter and sort files by fraction (Descending ensures we use the largest files first, minimizing total file count)
                     file_fractions = []
                     for nf in avail_nf:
                         f_val = get_fraction_from_filename(nf)
-                        
-                        # Test and secondarytest sets are often whole, not fractionally stripped. Force include them.
                         if "test" in target_name and f_val == 0.0:
                             f_val = 1.0 
-                            
                         if f_val > 0.0:
                             file_fractions.append((nf, f_val))
                             
@@ -176,18 +185,11 @@ def interactive_setup(data_dir: str, splits=None):
                             break
                         current_sum += f_val
                         
-                        # Use the string representation from filename or default formatting to find clean/index matches
-                        if "secondarytest" in nf:
-                            s_f = "secondarytest"
-                        elif "test" in nf:
-                            s_f = "test"
+                        if "secondarytest" in nf: s_f = "secondarytest"
+                        elif "test" in nf: s_f = "test"
                         else:
-                            # Replicate the f_val string safely from the matched regex
                             matched_str_grp = re.search(r'_([0-9]+\.[0-9]+)', nf)
-                            if matched_str_grp:
-                                s_f = matched_str_grp.group(1)
-                            else:
-                                s_f = "1"
+                            s_f = matched_str_grp.group(1) if matched_str_grp else "1"
                                 
                         clean_fn = f"groupadditivity_{s_f}.csv"
                         idx_fn = f"indices_{s_f}.csv"
@@ -225,13 +227,6 @@ def interactive_setup(data_dir: str, splits=None):
     return loaders_config
 
 def test_model(model, data_dir, loaders_config=None, test_loader=None, device=None, delta=False, base_name=None):
-    """
-    Dedicated function for testing a trained model.
-    Pass a loaders_config with 'test' defined, or it will launch the setup wizard.
-    """
-    from model.evaluate import test
-    import torch.nn as nn
-    
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -249,20 +244,17 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
             
         test_loader = loaders["test"]
         
-    criterion = nn.MSELoss() # Update this if your test function relies on another default
+    criterion = nn.MSELoss() 
     
     console.print("\n[bold cyan]--- Running Test Evaluation ---[/bold cyan]")
     test_loss = test(model, test_loader, criterion, device, delta=delta)
     console.print(f"[bold green]Final Test Loss:[/bold green] {test_loss:.6f}\n")
     
     if not base_name:
-        import time
         base_name = f"manual_test_{int(time.time())}"
         
-    tests_dir = os.path.join("results", "tests")
-    os.makedirs(tests_dir, exist_ok=True)
-    test_path = os.path.join(tests_dir, f"{base_name}_test.json")
-    import json
+    os.makedirs(os.path.join("results", "tests"), exist_ok=True)
+    test_path = os.path.join("results", "tests", f"{base_name}_test.json")
     with open(test_path, 'w') as f:
         json.dump({"test_loss": test_loss}, f, indent=4)
     console.print(f"[bold green]✔ Test Score saved safely to:[/bold green] {test_path}\n")
@@ -270,7 +262,6 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
     return test_loss
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--cloud_bundle", type=str, default=None, help="Path to a pre-packaged Train/Val .pt Kaggle Dataset Bundle")
     parser.add_argument("--test_bundle", type=str, default=None, help="Path to a pre-packaged Test .pt Kaggle Dataset Bundle")
@@ -284,36 +275,30 @@ def main():
         console.print(f"\n[bold magenta]--- KAGGLE SERVER ENVIRONMENT DETECTED ---[/bold magenta]")
         console.print(f"[cyan]Bypassing explicit wizard dependencies.[/cyan]")
         
-        from model.data_loader import get_cloud_dataloaders
         loaders = {}
         delta_choice = False
         
         if args.cloud_bundle:
-            l1 = get_cloud_dataloaders(args.cloud_bundle)
-            loaders.update(l1)
+            loaders.update(get_cloud_dataloaders(args.cloud_bundle))
             
         if args.test_bundle:
-            l2 = get_cloud_dataloaders(args.test_bundle)
-            loaders.update(l2)
+            loaders.update(get_cloud_dataloaders(args.test_bundle))
             
-        loaders_config = {"test": True} if "test" in loaders else {} # Mock configuration presence
-        
+        loaders_config = {"test": True} if "test" in loaders else {} 
         console.print(f"[bold green]✔ Headless Extraction Complete. Initiating Native Boot.[/bold green]\n")
         
-        # If no Train/Val is provided, just jump completely to test_model directly against weights!
-        if args.test_bundle and not args.cloud_bundle:
-             console.print("[yellow]Only Test Bundle Provided! (Please ensure you implement specific weight loading if you intended to do so later!)[/yellow]")
-        
-    # ---------------- INTERACTIVE LOCAL BOOT ---------------- #
     # ---------------- INTERACTIVE LOCAL BOOT ---------------- #
     else:
         console.print("\n[bold magenta]--- General Execution Mode ---[/bold magenta]")
-        import questionary
         
         exec_mode = questionary.select(
             "What would you like to do?",
-            choices=["Train a New Model", "Test an Existing Model"]
+            choices=["Train a New Model", "Test an Existing Model", "Kaggle Tools (Bundler/Runner)", "Exit"]
         ).ask()
+        
+        if exec_mode == "Exit":
+            console.print("\n[yellow]Exiting.[/yellow]")
+            return
         
         if exec_mode == "Test an Existing Model":
             model_files = glob.glob(os.path.join("results", "models", "*.pth"))
@@ -337,30 +322,25 @@ def main():
                     use_ready_loader = False
                 else:
                     chosen_bundle = questionary.select("Choose a dataset bundle:", choices=bundle_files).ask()
-                    from model.data_loader import get_cloud_dataloaders
-                    l1 = get_cloud_dataloaders(chosen_bundle)
-                    loaders.update(l1)
+                    loaders.update(get_cloud_dataloaders(chosen_bundle))
                     
             if not use_ready_loader:
                 loaders_config = interactive_setup(DATA_DIR, splits=["test"])
                 console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
                 loaders = get_dataloaders(loaders_config)
                 
-            # If the user chose a training bundle to evaluate training loss, we capture the best available loader
             test_loader = loaders.get("test") or loaders.get("val") or loaders.get("train")
             
             if test_loader is None:
                 console.print("[red]Test DataLoader could not be generated. Aborting.[/red]")
                 return
 
-            import json
             base = os.path.basename(chosen_model_path).replace(".pth", "")
             base_config = os.path.join("results", "configs", f"{base}_config.json")
+            run_config = config
             if os.path.exists(base_config):
                 with open(base_config, 'r') as f:
                     run_config = json.load(f)
-            else:
-                run_config = config
                 
             if delta_choice:
                 model = MLPDelta(
@@ -388,43 +368,96 @@ def main():
             )
             return
 
+        if exec_mode == "Kaggle Tools (Bundler/Runner)":
+            kaggle_choice = questionary.select(
+                "Which Kaggle script do you want to generate?",
+                choices=[
+                    "Dataset BUNDLER (Merge raw files into .pt)",
+                    "Training RUNNER (Train from .pt bundles)"
+                ]
+            ).ask()
+
+            if "BUNDLER" in kaggle_choice:
+                console.print("\n[bold magenta]--- Kaggle Bundler Config ---[/bold magenta]")
+                loaders_config = interactive_setup(DATA_DIR)
+                
+                # Using our helper for yellow highlights and empty input
+                username = ask_with_default("Enter your Kaggle Username (slug)", "username")
+                dataset_name = ask_with_default("Enter the name of your unified Dataset (folder)", "project-data")
+                script_name = ask_with_default("Enter the name of your Script Dataset (folder)", "src-model")
+                train_val_name = ask_with_default("Enter name for Train/Val bundle", "kaggle_train_val.pt")
+                test_name = ask_with_default("Enter name for Test bundle", "kaggle_test.pt")
+                
+                script_content = generate_kaggle_bundler(
+                    loaders_config, username=username, dataset_name=dataset_name, 
+                    script_name=script_name, train_val_name=train_val_name, test_name=test_name
+                )
+                
+                os.makedirs(os.path.join("results", "kaggle_scripts"), exist_ok=True)
+                timestamp = int(time.time())
+                script_path = os.path.join("results", "kaggle_scripts", f"kaggle_bundle_gen_{timestamp}.py")
+                with open(script_path, 'w') as f:
+                    f.write(script_content)
+                
+                console.print(f"\n[bold green]✔ Kaggle Dataset Bundler Script generated at:[/bold green] {script_path}")
+                return
+
+            if "RUNNER" in kaggle_choice:
+                console.print("\n[bold magenta]--- Kaggle Training Runner Config ---[/bold magenta]")
+                
+                username = ask_with_default("Enter your Kaggle Username (slug)", "username")
+                train_val_slug = ask_with_default("Enter Dataset Slug containing your Train/Val bundle", "project-data")
+                test_slug = ask_with_default("Enter Dataset Slug containing your Test bundle", "project-data")
+                script_slug = ask_with_default("Enter Dataset Slug containing your Source Code", "src-model")
+                train_val_name = ask_with_default("Enter filename of your Train/Val bundle", "kaggle_train_val.pt")
+                test_name = ask_with_default("Enter filename of your Test bundle", "kaggle_test.pt")
+                
+                do_test = questionary.confirm("Would you like to run test evaluation after training?", default=True).ask()
+                delta_choice = questionary.confirm("Use Delta Learning (Residual Correction)?", default=False).ask()
+                
+                timestamp = int(time.time())
+                default_run_name = f"MLP_run_{timestamp}"
+                base_name = ask_with_default("Enter a base name for the Kaggle results", default_run_name)
+                
+                loaders_config = {"train": True, "val": True, "test": True}
+                script_content = generate_kaggle_runner(
+                    loaders_config, config, delta_choice,
+                    username=username, train_val_slug=train_val_slug, test_slug=test_slug,
+                    script_slug=script_slug, train_val_name=train_val_name, test_name=test_name,
+                    do_test=do_test, base_name=base_name
+                )
+                
+                os.makedirs(os.path.join("results", "kaggle_scripts"), exist_ok=True)
+                timestamp = int(time.time())
+                script_path = os.path.join("results", "kaggle_scripts", f"kaggle_train_runner_{timestamp}.py")
+                with open(script_path, 'w') as f:
+                    f.write(script_content)
+                
+                console.print(f"\n[bold green]✔ Kaggle Training Runner Script generated at:[/bold green] {script_path}")
+                return
+
         # ==========================================
         # TRAIN A NEW MODEL
         # ==========================================
         console.print("\n[bold magenta]--- New Model Training Config ---[/bold magenta]")
-        
-        delta_choice = questionary.confirm("Are we performing Delta Training (predicting noise differences)?", default=False).ask()
-        
-        use_ready_loader = questionary.confirm("Train locally with an already ready data loader bundle (.pt)?", default=False).ask()
+        delta_choice = questionary.confirm("Are we performing Delta Training?", default=False).ask()
+        use_ready_loader = questionary.confirm("Train locally with an already ready data loader bundle (.pts)?", default=False).ask()
         
         loaders = {}
-        
         if use_ready_loader:
             bundle_files = glob.glob(os.path.join("results", "cloud_datasets", "*.pt"))
             if not bundle_files:
-                console.print("[yellow]No '.pt' bundles found in 'results/cloud_datasets/'. Falling back to manual setup.[/yellow]")
+                console.print("[yellow]No '.pt' bundles found. Falling back to manual setup.[/yellow]")
                 use_ready_loader = False
             else:
-                chosen_bundle = questionary.select(
-                    "Choose a dataset bundle:",
-                    choices=bundle_files
-                ).ask()
-                
-                from model.data_loader import get_cloud_dataloaders
-                l1 = get_cloud_dataloaders(chosen_bundle)
-                loaders.update(l1)
+                chosen_bundle = questionary.select("Choose a dataset bundle:", choices=bundle_files).ask()
+                loaders.update(get_cloud_dataloaders(chosen_bundle))
                 loaders_config = {"test": True} if "test" in loaders else {}
                 
         if not use_ready_loader:
-            
-            # Run the interactive setup wizard for train & val
             loaders_config = interactive_setup(DATA_DIR)
-        
             console.print("\n[bold cyan]Loading Datasets...[/bold cyan]")
-            
-            # Retrieve pre-constructed dataloaders based on the wizard settings
             loaders = get_dataloaders(loaders_config)
-            print("OK Dataloaders")
             
             action_choice = questionary.select(
                 "Dataset Generation Complete! What would you like to do next?",
@@ -433,111 +466,67 @@ def main():
             ).ask()
             
             if action_choice in ["Export to Cloud (.pt)", "Both"]:
-                import time
                 timestamp = int(time.time())
-                from model.data_loader import export_to_cloud_bundle
                 console.print(f"\n[cyan]Packaging Native PyTorch Tensors for Cloud Deployment...[/cyan]")
                 
                 train_val_loaders = {k: v for k, v in loaders.items() if k in ["train", "val"]}
                 test_loaders = {k: v for k, v in loaders.items() if k == "test"}
                 
                 if train_val_loaders:
-                    custom_train_name = questionary.text("Enter a name for the Train/Val dataset bundle (leave blank for timestamp):").ask()
+                    custom_train_name = questionary.text("Enter a name for the Train/Val dataset bundle:").ask()
                     bundle_tr_name = custom_train_name if custom_train_name else f"kaggle_train_val_{timestamp}"
                     export_path_train = os.path.join("results", "cloud_datasets", f"{bundle_tr_name}.pt")
                     export_to_cloud_bundle(train_val_loaders, export_path_train)
-                    console.print(f"[bold green]✔ Train/Val Dataset successfully sealed at:[/bold green] {export_path_train}")
+                    console.print(f"[bold green]✔ Train/Val Dataset sealed at:[/bold green] {export_path_train}")
                     
                 if test_loaders:
-                    custom_test_name = questionary.text("Enter a name for the Test dataset bundle (leave blank for timestamp):").ask()
+                    custom_test_name = questionary.text("Enter a name for the Test dataset bundle:").ask()
                     bundle_te_name = custom_test_name if custom_test_name else f"kaggle_test_{timestamp}"
                     export_path_test = os.path.join("results", "cloud_datasets", f"{bundle_te_name}.pt")
                     export_to_cloud_bundle(test_loaders, export_path_test)
-                    console.print(f"[bold green]✔ Test Dataset successfully sealed at:[/bold green] {export_path_test}")
+                    console.print(f"[bold green]✔ Test Dataset sealed at:[/bold green] {export_path_test}")
                 
                 if action_choice == "Export to Cloud (.pt)":
-                    console.print("\n[yellow]Skipping Local Training. Exiting.[/yellow]")
                     return
 
-    # Final model setup
     if delta_choice:
-        model = MLPDelta(
-            input_dim=config["input_dim"],
-            hidden_dims=config["hidden_dims"],
-            dropout=config["dropout"],
-        ).to(device)
+        model = MLPDelta(config["input_dim"], config["hidden_dims"], config["dropout"]).to(device)
     else:
-        model = MLP(
-            input_dim=config["input_dim"],
-            hidden_dims=config["hidden_dims"],
-            dropout=config["dropout"],
-        ).to(device)
+        model = MLP(config["input_dim"], config["hidden_dims"], config["dropout"]).to(device)
 
-    # Train model if training splits are present
     if "train" in loaders and "val" in loaders:
         model, history = train(model, loaders, config, device, delta=delta_choice)
         plot_history(history)
         
-        # Save Model and History automatically
-        import time, json
         delta_str = "delta" if delta_choice else "nodelta"
         timestamp = int(time.time())
         default_base_name = f"MLP_{delta_str}_{timestamp}"
-        
-        custom_base_name = questionary.text(f"Enter a base name for the model results (leave blank for: {default_base_name}):").ask()
+        custom_base_name = questionary.text(f"Enter a base name for the results (leave blank for: {default_base_name}):").ask()
         base_name = custom_base_name if custom_base_name else default_base_name
         
         config["delta"] = delta_choice
+        os.makedirs(os.path.join("results", "models"), exist_ok=True)
+        os.makedirs(os.path.join("results", "histories"), exist_ok=True)
+        os.makedirs(os.path.join("results", "configs"), exist_ok=True)
+        os.makedirs(os.path.join("results", "plots"), exist_ok=True)
         
-        models_dir = os.path.join("results", "models")
-        histories_dir = os.path.join("results", "histories")
-        configs_dir = os.path.join("results", "configs")
-        
-        os.makedirs(models_dir, exist_ok=True)
-        os.makedirs(histories_dir, exist_ok=True)
-        os.makedirs(configs_dir, exist_ok=True)
-        
-        model_path = os.path.join(models_dir, f"{base_name}.pth")
-        history_path = os.path.join(histories_dir, f"{base_name}_history.json")
-        config_path = os.path.join(configs_dir, f"{base_name}_config.json")
-        plots_dir = os.path.join("results", "plots")
-        os.makedirs(plots_dir, exist_ok=True)
-        plot_path = os.path.join(plots_dir, f"{base_name}_curve.png")
-        
-        torch.save(model.state_dict(), model_path)
-        with open(history_path, 'w') as f:
+        torch.save(model.state_dict(), os.path.join("results", "models", f"{base_name}.pth"))
+        with open(os.path.join("results", "histories", f"{base_name}_history.json"), 'w') as f:
             json.dump(history, f, indent=4)
-        with open(config_path, 'w') as f:
+        with open(os.path.join("results", "configs", f"{base_name}_config.json"), 'w') as f:
             json.dump(config, f, indent=4)
             
-        import matplotlib.pyplot as plt
         plt.figure(figsize=(10,6))
-        plt.plot(history['train_loss'], label='Train Loss', color='blue', linewidth=2)
-        plt.plot(history['val_loss'], label='Validation Loss', color='orange', linewidth=2)
+        plt.plot(history['train_loss'], label='Train Loss', color='blue')
+        plt.plot(history['val_loss'], label='Validation Loss', color='orange')
         plt.title(f"Training Convergence - {base_name}")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss (MSE)")
-        plt.legend()
-        plt.grid()
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join("results", "plots", f"{base_name}_curve.png"), dpi=300)
         plt.close()
             
-        console.print(f"\n[bold green]✔ Model saved safely to:[/bold green] {model_path}")
-        console.print(f"[bold green]✔ History saved safely to:[/bold green] {history_path}")
-        console.print(f"[bold green]✔ Config saved safely to:[/bold green] {config_path}")
-        console.print(f"[bold green]✔ Curve Plotted safely to:[/bold green] {plot_path}\n")
+        console.print(f"\n[bold green]✔ Results saved to results/ for:[/bold green] {base_name}\n")
         
-    # Execute Test Phase if explicitly requested
     if "test" in loaders_config or "test" in loaders:
-        test_model(
-            model, 
-            DATA_DIR, 
-            loaders_config=loaders_config, 
-            test_loader=loaders.get("test"), 
-            device=device, 
-            delta=delta_choice if 'delta_choice' in locals() else False,
-            base_name=base_name if 'base_name' in locals() else None
-        )
+        test_model(model, DATA_DIR, loaders_config, loaders.get("test"), device, delta_choice, base_name if "base_name" in locals() else None)
 
 if __name__ == "__main__":
     main()
