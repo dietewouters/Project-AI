@@ -17,6 +17,8 @@ from config import config
 from model.train import train
 from model.evaluate import test
 from utils.kaggle_gen import generate_kaggle_bundler, generate_kaggle_runner
+from model.data_loader_scaled import get_dataloaders_scaled
+# from optimize import run_optimization
 
 console = Console()
 
@@ -43,6 +45,16 @@ def ask_with_default(msg, def_val):
 def plot_history(history: dict):
     plt.plot(history["train_loss"], label="Train Loss")
     plt.plot(history["val_loss"], label="Val Loss")
+    plt.plot(history["train_eval_loss"], label="Train Loss at end of epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training History")
+    plt.legend()
+    plt.show()
+
+def plot_history2(history: dict):
+    plt.plot(history["val_loss"], label="Val Loss")
+    plt.plot(history["train_eval_loss"], label="Train Loss at end of epoch")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training History")
@@ -226,7 +238,13 @@ def interactive_setup(data_dir: str, splits=None):
             
     return loaders_config
 
-def test_model(model, data_dir, loaders_config=None, test_loader=None, device=None, delta=False, base_name=None):
+def test_model(model, data_dir, loaders_config=None, test_loader=None, device=None, delta=False, base_name=None, target_scaler=None):
+    """
+    Dedicated function for testing a trained model.
+    Pass a loaders_config with 'test' defined, or it will launch the setup wizard.
+    """
+    from model.evaluate import test
+    import torch.nn as nn
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -234,20 +252,37 @@ def test_model(model, data_dir, loaders_config=None, test_loader=None, device=No
         if loaders_config is None or "test" not in loaders_config:
             console.print("\n[bold yellow]No test configuration passed. Launching Wizard...[/bold yellow]")
             loaders_config = interactive_setup(data_dir, splits=["test"])
-            
+
         console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
-        loaders = get_dataloaders(loaders_config)
-        
+
+        scaling_type = None
+        if "test" in loaders_config:
+            scaling_type = loaders_config["test"].get("scaling", "none")
+
+        if scaling_type == "none":
+            loaders = get_dataloaders(loaders_config)
+            train_names = set(loaders['train'].dataset.names)
+
+        else:
+            loaders, target_scaler = get_dataloaders_scaled(loaders_config)
+
         if "test" not in loaders:
             console.print("[red]Test DataLoader could not be built. Aborting test.[/red]")
             return None
-            
+
         test_loader = loaders["test"]
         
     criterion = nn.MSELoss() 
     
     console.print("\n[bold cyan]--- Running Test Evaluation ---[/bold cyan]")
-    test_loss = test(model, test_loader, criterion, device, delta=delta)
+    test_loss = test(
+    model,
+    test_loader,
+    criterion,
+    device,
+    delta=delta,
+    target_scaler=target_scaler
+)
     console.print(f"[bold green]Final Test Loss:[/bold green] {test_loss:.6f}\n")
     
     if not base_name:
@@ -269,6 +304,7 @@ def main():
     
     DATA_DIR = config["data_path"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    target_scaler = None
     
     # ---------------- HEADLESS KAGGLE BOOT ---------------- #
     if args.cloud_bundle or args.test_bundle:
@@ -361,10 +397,11 @@ def main():
                 model, 
                 DATA_DIR, 
                 loaders_config=loaders_config, 
-                test_loader=test_loader, 
+                test_loader=loaders.get("test"), 
                 device=device, 
                 delta=delta_choice,
-                base_name=base
+                base_name=base_name,
+                target_scaler=target_scaler
             )
             return
 
@@ -443,6 +480,15 @@ def main():
         delta_choice = questionary.confirm("Are we performing Delta Training?", default=False).ask()
         use_ready_loader = questionary.confirm("Train locally with an already ready data loader bundle (.pts)?", default=False).ask()
         
+        scaling_type = questionary.select(
+        "Which scaling do you want to use for enthalpy values?",
+        choices=[
+            "none",
+            "standard",
+            "minmax"
+            ]
+        ).ask()
+        
         loaders = {}
         if use_ready_loader:
             bundle_files = glob.glob(os.path.join("results", "cloud_datasets", "*.pt"))
@@ -453,11 +499,26 @@ def main():
                 chosen_bundle = questionary.select("Choose a dataset bundle:", choices=bundle_files).ask()
                 loaders.update(get_cloud_dataloaders(chosen_bundle))
                 loaders_config = {"test": True} if "test" in loaders else {}
+                target_scaler = None
                 
         if not use_ready_loader:
+            # Run the interactive setup wizard for train & val
             loaders_config = interactive_setup(DATA_DIR)
             console.print("\n[bold cyan]Loading Datasets...[/bold cyan]")
-            loaders = get_dataloaders(loaders_config)
+
+            if scaling_type == "none":
+                loaders = get_dataloaders(loaders_config)
+                target_scaler = None
+                train_names = set(loaders['train'].dataset.names)
+                val_names = set(loaders['val'].dataset.names)
+                overlap = train_names.intersection(val_names)
+                print(f"\n[DEBUG] Overlap train-val molecules: {len(overlap)}")
+            else:
+                for split in ["train", "val", "test"]:
+                    if split in loaders_config:
+                        loaders_config[split]["scaling"] = scaling_type
+                loaders, target_scaler = get_dataloaders_scaled(loaders_config)
+            print("OK Dataloaders")
             
             action_choice = questionary.select(
                 "Dataset Generation Complete! What would you like to do next?",
@@ -495,8 +556,16 @@ def main():
         model = MLP(config["input_dim"], config["hidden_dims"], config["dropout"]).to(device)
 
     if "train" in loaders and "val" in loaders:
-        model, history = train(model, loaders, config, device, delta=delta_choice)
+        model, history = train(
+            model,
+            loaders,
+            config,
+            device,
+            delta=delta_choice,
+            target_scaler=target_scaler
+        )
         plot_history(history)
+        plot_history2(history)
         
         delta_str = "delta" if delta_choice else "nodelta"
         timestamp = int(time.time())
@@ -526,7 +595,16 @@ def main():
         console.print(f"\n[bold green]✔ Results saved to results/ for:[/bold green] {base_name}\n")
         
     if "test" in loaders_config or "test" in loaders:
-        test_model(model, DATA_DIR, loaders_config, loaders.get("test"), device, delta_choice, base_name if "base_name" in locals() else None)
+        test_model(
+            model, 
+            DATA_DIR, 
+            loaders_config=loaders_config, 
+            test_loader=loaders.get("test"), 
+            device=device, 
+            delta=delta_choice if 'delta_choice' in locals() else False,
+            base_name=base_name if 'base_name' in locals() else None,
+            target_scaler=target_scaler
+        )
 
 if __name__ == "__main__":
     main()

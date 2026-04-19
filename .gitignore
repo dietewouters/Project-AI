@@ -237,5 +237,11 @@ __MACOSX/
 # VSCode
 .vscode/
 
+# intelliJ
+.idea/
+
 # Python virtual environments
 conda-env/
+
+# data
+data/
