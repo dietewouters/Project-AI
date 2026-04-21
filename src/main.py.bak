@@ -1,0 +1,637 @@
+import os
+import glob
+import itertools
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from rich.console import Console
+from rich.prompt import Prompt, Confirm, IntPrompt, FloatPrompt
+import questionary
+import time
+import json
+import re
+import argparse
+from model.data_loader import get_dataloaders, get_cloud_dataloaders, export_to_cloud_bundle
+from model.scaler import PropertyScaler
+from model.model import MLP, MLPDelta
+from config import config
+from model.train import train
+from model.evaluate import test
+from utils.kaggle_gen import generate_kaggle_bundler, generate_kaggle_runner
+
+console = Console()
+
+def ask_with_default(msg, def_val):
+    """
+    Helper to ask a question with a default value shown in yellow parentheses.
+    Uses Rich for perfect styling and native input for absolute 'Enter key' reliability.
+    """
+    # Print the question with yellow parentheses using Rich
+    console.print(f"\n[bold white]?[/bold white] {msg} [yellow]({def_val})[/yellow]: ", end="")
+    
+    # Capture input natively - no ANSI symbols, no random brackets
+    try:
+        val = input().strip()
+    except EOFError:
+        return def_val
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user.[/yellow]")
+        raise
+        
+    # Return user input or the default fallback
+    return val if val else def_val
+
+def plot_history(history: dict):
+    plt.plot(history["train_loss"], label="Train Loss")
+    plt.plot(history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training History")
+    plt.legend()
+    plt.show()
+
+def get_file_len(filepath):
+    # Fast line counter skipping header
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            return sum(1 for _ in f) - 1
+    return 0
+
+def get_fraction_from_filename(filename):
+    match = re.search(r'_([0-9]+\.[0-9]+)', filename)
+    if match:
+        return float(match.group(1))
+    match_int = re.search(r'_1[_\.]', filename)
+    if match_int:
+        return 1.0
+    return 0.0
+
+def interactive_setup(data_dir: str, splits=None):
+    console.print("\n[bold magenta]--- Dataset Setup Wizard ---[/bold magenta]")
+    
+    dataset_dir = os.path.join(data_dir, "dataset")
+    indices_dir = os.path.join(data_dir, "indices")
+    
+    if not os.path.exists(dataset_dir):
+        os.makedirs(dataset_dir, exist_ok=True)
+    
+    if splits is None:
+        splits = ["train", "val"]
+    
+    available_targets = glob.glob(os.path.join(dataset_dir, "*.csv"))
+    available_targets = [os.path.basename(f) for f in available_targets if "noise" not in os.path.basename(f)]
+    
+    if not available_targets:
+        available_targets = ["groupadditivity_1.csv", "groupadditivity_secondarytest.csv", "groupadditivity_test.csv"]
+        
+    loaders_config = {}
+    
+    for split in splits:
+        console.print(f"\n[bold cyan]Configuring {split.upper()} Dataset[/bold cyan]")
+        
+        # Smart defaults based on split
+        def_target = available_targets[0]
+        if split == "train" and "groupadditivity_1.csv" in available_targets: def_target = "groupadditivity_1.csv"
+        if split == "val" and "groupadditivity_secondarytest.csv" in available_targets: def_target = "groupadditivity_secondarytest.csv"
+        if split == "test" and "groupadditivity_test.csv" in available_targets: def_target = "groupadditivity_test.csv"
+        
+        target_name = questionary.select(
+            f"Select Target Master Dictionary for {split.upper()}:",
+            choices=available_targets,
+            default=def_target
+        ).ask()
+        
+        target_path = os.path.join(dataset_dir, target_name)
+        
+        parts = target_name.split('_')
+        indices_filename = "indices_" + parts[-1] if len(parts) > 1 else target_name
+        indices_path = os.path.join(indices_dir, indices_filename)
+        
+        max_mols = get_file_len(target_path)
+        if max_mols <= 0: max_mols = 1000 
+        
+        total_molecules = IntPrompt.ask(f"How many total molecules to use? (Max: {max_mols})", default=max_mols)
+        master_fraction_ratio = float(total_molecules) / max_mols if max_mols > 0 else 1.0
+        
+        mode = questionary.select("Select noise generation mode", choices=["precomputed", "on-the-fly"], default="precomputed").ask()
+        
+        if mode == "precomputed":
+            try:
+                noise_dirs = [d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d)) and "noise" in d.lower()]
+            except FileNotFoundError:
+                noise_dirs = []
+                
+            if not noise_dirs:
+                noise_dirs = ["noise0.01", "noise0.02", "noise20_nitrogen"]
+                
+            active_noise_dirs = questionary.checkbox(
+                "Select which noise levels to include in this set (Space to check, Enter to submit):",
+                choices=noise_dirs
+            ).ask()
+            
+            if not active_noise_dirs:
+                active_noise_dirs = []
+                    
+            dataset_blocks = []
+            if active_noise_dirs:
+                fully_random = questionary.confirm("Distribute perfectly equally automatically?", default=False).ask()
+                remaining = 1.0
+                
+                for i, d in enumerate(active_noise_dirs):
+                    if fully_random:
+                        pct = 1.0 / len(active_noise_dirs)
+                    else:
+                        if i == len(active_noise_dirs) - 1:
+                            pct = remaining
+                            console.print(f"[green]Auto-assigning remaining {pct*100:.1f}% to '{d}'.[/green]")
+                        else:
+                            pct_str = Prompt.ask(f"Fraction for '{d}'? (0.0 to {remaining:.2f})", default=str(round(remaining / (len(active_noise_dirs)-i), 2)))
+                            pct = float(pct_str)
+                            if pct > remaining:
+                                pct = remaining
+                            remaining -= pct
+                    
+                    # Use the full requested fraction for EACH level because files overlap
+                    # De-duplication in the data_loader will then pick a balanced mix
+                    req_fraction = master_fraction_ratio 
+                    console.print(f"Targeting fraction ~{req_fraction:.3f} for noise '{d}'")
+                    
+                    noise_dir_path = os.path.join(dataset_dir, d)
+                    try:
+                        avail_nf = [f for f in os.listdir(noise_dir_path) if "groupadditivity_" in f and f.endswith(".csv")]
+                    except FileNotFoundError:
+                        avail_nf = []
+                        
+                    if "secondarytest" in target_name:
+                        avail_nf = [f for f in avail_nf if "secondarytest" in f]
+                    elif "test" in target_name:
+                        avail_nf = [f for f in avail_nf if "test" in f and "secondarytest" not in f]
+                    else:
+                        avail_nf = [f for f in avail_nf if "test" not in f]
+                        
+                    file_fractions = []
+                    for nf in avail_nf:
+                        f_val = get_fraction_from_filename(nf)
+                        if "test" in target_name and f_val == 0.0:
+                            f_val = 1.0 
+                        if f_val > 0.0:
+                            file_fractions.append((nf, f_val))
+                            
+                    if not file_fractions:
+                        console.print(f"  [red]Warning: No appropriately matched noise files found in '{d}' for '{target_name}'![/red]")
+                        
+                    # --- SMART FILE SELECTION ---
+                    # We want to find the combination of files that is CLOSEST to req_fraction
+                    # while using the FEWEST number of files.
+                    best_subset = []
+                    min_diff = float('inf')
+                    
+                    # Try combinations of 1, 2, or 3 files
+                    limit_k = min(len(file_fractions) + 1, 4)
+                    for k in range(1, limit_k):
+                        found_k_improvement = False
+                        for combo in itertools.combinations(file_fractions, k):
+                            combo_sum = sum(c[1] for c in combo)
+                            diff = abs(combo_sum - req_fraction)
+                            
+                            # Use 5% improvement threshold to justify adding more files
+                            if diff < min_diff * 0.95:
+                                min_diff = diff
+                                best_subset = combo
+                                found_k_improvement = True
+                        
+                        # If adding more files (k+1) didn't help much, we stop at this k
+                        if not found_k_improvement and k > 1:
+                            break
+                    
+                    if not best_subset:
+                        console.print(f"  [red]Warning: No appropriately matched noise files found in '{d}' for '{target_name}'![/red]")
+                        continue
+                        
+                    for nf, f_val in best_subset:
+                        if "secondarytest" in nf: s_f = "secondarytest"
+                        elif "test" in nf: s_f = "test"
+                        else:
+                            matched_str_grp = re.search(r'_([0-9]+\.[0-9]+)', nf)
+                            s_f = matched_str_grp.group(1) if matched_str_grp else "1"
+                                
+                        clean_fn = f"groupadditivity_{s_f}.csv"
+                        idx_fn = f"indices_{s_f}.csv"
+                        
+                        dataset_blocks.append({
+                            "clean_path": os.path.join(dataset_dir, clean_fn),
+                            "noisy_path": os.path.join(noise_dir_path, nf),
+                            "indices_path": os.path.join(indices_dir, idx_fn)
+                        })
+                        console.print(f"  [cyan]+ Picked File:[/cyan] {nf} (fraction {f_val})")
+            
+            loaders_config[split] = {
+                "mode": "precomputed",
+                "target_path": target_path,
+                "indices_path": indices_path,
+                "total_molecules": total_molecules,
+                "blocks": dataset_blocks
+            }
+            
+        elif mode == "on-the-fly":
+            noise_std = Prompt.ask("Enter Gaussian noise standard deviation", default="0.01")
+            loaders_config[split] = {
+                "mode": "on-the-fly",
+                "target_path": target_path,
+                "indices_path": indices_path,
+                "total_molecules": total_molecules,
+                "noise_std": float(noise_std)
+            }
+            
+    if splits == ["train", "val"]:
+        if Confirm.ask("\n[bold yellow]Do you want to configure a Test dataset as well?[/bold yellow]", default=False):
+            test_config = interactive_setup(data_dir, splits=["test"])
+            loaders_config.update(test_config)
+            
+    return loaders_config
+
+def test_model(model, data_dir, loaders_config=None, test_loader=None, device=None, delta=False, base_name=None, scaler=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    if test_loader is None:
+        if loaders_config is None or "test" not in loaders_config:
+            console.print("\n[bold yellow]No test configuration passed. Launching Wizard...[/bold yellow]")
+            loaders_config = interactive_setup(data_dir, splits=["test"])
+            
+        console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
+        loaders = get_dataloaders(loaders_config)
+        
+        if "test" not in loaders:
+            console.print("[red]Test DataLoader could not be built. Aborting test.[/red]")
+            return None
+            
+        test_loader = loaders["test"]
+        
+    criterion = nn.MSELoss() 
+    
+    console.print("\n[bold cyan]--- Running Test Evaluation ---[/bold cyan]")
+    test_loss = test(model, test_loader, criterion, device, delta=delta, scaler=scaler)
+    console.print(f"[bold green]Final Test Loss:[/bold green] {test_loss:.6f}\n")
+    
+    if not base_name:
+        base_name = f"manual_test_{int(time.time())}"
+        
+    os.makedirs(os.path.join("results", "tests"), exist_ok=True)
+    test_path = os.path.join("results", "tests", f"{base_name}_test.json")
+    with open(test_path, 'w') as f:
+        json.dump({"test_loss": test_loss}, f, indent=4)
+    console.print(f"[bold green]✔ Test Score saved safely to:[/bold green] {test_path}\n")
+        
+    return test_loss
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cloud_bundle", type=str, default=None, help="Path to a pre-packaged Train/Val .pt Kaggle Dataset Bundle")
+    parser.add_argument("--test_bundle", type=str, default=None, help="Path to a pre-packaged Test .pt Kaggle Dataset Bundle")
+    args = parser.parse_args()
+    
+    DATA_DIR = config["data_path"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # ---------------- HEADLESS KAGGLE BOOT ---------------- #
+    if args.cloud_bundle or args.test_bundle:
+        console.print(f"\n[bold magenta]--- KAGGLE SERVER ENVIRONMENT DETECTED ---[/bold magenta]")
+        console.print(f"[cyan]Bypassing explicit wizard dependencies.[/cyan]")
+        
+        loaders = {}
+        delta_choice = False
+        
+        if args.cloud_bundle:
+            loaders.update(get_cloud_dataloaders(args.cloud_bundle))
+            
+        if args.test_bundle:
+            loaders.update(get_cloud_dataloaders(args.test_bundle))
+            
+        loaders_config = {"test": True} if "test" in loaders else {} 
+        console.print(f"[bold green]✔ Headless Extraction Complete. Initiating Native Boot.[/bold green]\n")
+        
+    # ---------------- INTERACTIVE LOCAL BOOT ---------------- #
+    else:
+        console.print("\n[bold magenta]--- General Execution Mode ---[/bold magenta]")
+        
+        exec_mode = questionary.select(
+            "What would you like to do?",
+            choices=["Train a New Model", "Test an Existing Model", "Kaggle Tools (Bundler/Runner)", "Exit"]
+        ).ask()
+        
+        if exec_mode == "Exit":
+            console.print("\n[yellow]Exiting.[/yellow]")
+            return
+        
+        if exec_mode == "Test an Existing Model":
+            model_files = glob.glob(os.path.join("results", "models", "*.pth"))
+            if not model_files:
+                console.print("[red]No trained models found in results/models/ ![/red]")
+                return
+            chosen_model_path = questionary.select("Select a trained model to evaluate:", choices=model_files).ask()
+            
+            delta_choice = questionary.confirm("Are we performing Delta Evaluation (predicting noise differences)?", default=False).ask()
+            
+            console.print("\n[bold magenta]--- Test Dataset Config ---[/bold magenta]")
+            use_ready_loader = questionary.confirm("Provide testing dataset from an already ready bundle (.pt)?", default=False).ask()
+            
+            loaders = {}
+            loaders_config = {}
+            
+            if use_ready_loader:
+                bundle_files = glob.glob(os.path.join("results", "cloud_datasets", "*.pt"))
+                if not bundle_files:
+                    console.print("[yellow]No '.pt' bundles found. Falling back to manual setup.[/yellow]")
+                    use_ready_loader = False
+                else:
+                    chosen_bundle = questionary.select("Choose a dataset bundle:", choices=bundle_files).ask()
+                    bundle = torch.load(chosen_bundle)
+                    loaders.update(get_cloud_dataloaders(chosen_bundle))
+                    scaler = PropertyScaler.from_dict(bundle.get("metadata", {})) if "metadata" in bundle else None
+                    
+            if not use_ready_loader:
+                loaders_config = interactive_setup(DATA_DIR, splits=["test"])
+                console.print("\n[bold cyan]Loading Test Dataset...[/bold cyan]")
+                loaders = get_dataloaders(loaders_config)
+                
+                # Select Scaling Strategy for Test
+                scaling_mode = questionary.select(
+                    "Select Scaling Strategy for Calculation:",
+                    choices=[
+                        questionary.Choice("Delta Scaling (Signal Amplification)", value="delta"),
+                        questionary.Choice("Standard Scaling (Independent)", value="standard"),
+                        questionary.Choice("MinMax Scaling (Bound to [0,1])", value="minmax"),
+                        questionary.Choice("None (Raw Physical Units)", value="none")
+                    ],
+                    default="delta"
+                ).ask()
+                
+                scaler = None
+                if "test" in loaders:
+                    scaler = loaders["test"].dataset.get_scaler(mode=scaling_mode)
+                elif "val" in loaders:
+                    scaler = loaders["val"].dataset.get_scaler(mode=scaling_mode)
+                elif "train" in loaders:
+                    scaler = loaders["train"].dataset.get_scaler(mode=scaling_mode)
+                
+            test_loader = loaders.get("test") or loaders.get("val") or loaders.get("train")
+            
+            if test_loader is None:
+                console.print("[red]Test DataLoader could not be generated. Aborting.[/red]")
+                return
+
+            base = os.path.basename(chosen_model_path).replace(".pth", "")
+            base_config = os.path.join("results", "configs", f"{base}_config.json")
+            run_config = config
+            if os.path.exists(base_config):
+                with open(base_config, 'r') as f:
+                    run_config = json.load(f)
+                
+            if delta_choice:
+                model = MLPDelta(
+                    input_dim=run_config["input_dim"],
+                    hidden_dims=run_config["hidden_dims"],
+                    dropout=run_config["dropout"],
+                ).to(device)
+            else:
+                model = MLP(
+                    input_dim=run_config["input_dim"],
+                    hidden_dims=run_config["hidden_dims"],
+                    dropout=run_config["dropout"],
+                ).to(device)
+                
+            model.load_state_dict(torch.load(chosen_model_path, map_location=device, weights_only=True))
+            
+            test_model(
+                model, 
+                DATA_DIR, 
+                loaders_config=loaders_config, 
+                test_loader=test_loader, 
+                device=device, 
+                delta=delta_choice,
+                base_name=base,
+                scaler=locals().get("scaler")
+            )
+            return
+
+        if exec_mode == "Kaggle Tools (Bundler/Runner)":
+            kaggle_choice = questionary.select(
+                "Which Kaggle script do you want to generate?",
+                choices=[
+                    "Dataset BUNDLER (Merge raw files into .pt)",
+                    "Training RUNNER (Train from .pt bundles)"
+                ]
+            ).ask()
+
+            if "BUNDLER" in kaggle_choice:
+                console.print("\n[bold magenta]--- Kaggle Bundler Config ---[/bold magenta]")
+                loaders_config = interactive_setup(DATA_DIR)
+                
+                # Using our helper for yellow highlights and empty input
+                username = ask_with_default("Enter your Kaggle Username (slug)", "username")
+                dataset_name = ask_with_default("Enter the name of your unified Dataset (folder)", "project-data")
+                script_name = ask_with_default("Enter the name of your Script Dataset (folder)", "src-model")
+                train_val_name = ask_with_default("Enter name for Train/Val bundle", "kaggle_train_val.pt")
+                test_name = ask_with_default("Enter name for Test bundle", "kaggle_test.pt")
+                
+                script_content = generate_kaggle_bundler(
+                    loaders_config, username=username, dataset_name=dataset_name, 
+                    script_name=script_name, train_val_name=train_val_name, test_name=test_name
+                )
+                
+                os.makedirs(os.path.join("results", "kaggle_scripts"), exist_ok=True)
+                timestamp = int(time.time())
+                script_path = os.path.join("results", "kaggle_scripts", f"kaggle_bundle_gen_{timestamp}.py")
+                with open(script_path, 'w') as f:
+                    f.write(script_content)
+                
+                console.print(f"\n[bold green]✔ Kaggle Dataset Bundler Script generated at:[/bold green] {script_path}")
+                return
+
+            if "RUNNER" in kaggle_choice:
+                console.print("\n[bold magenta]--- Kaggle Training Runner Config ---[/bold magenta]")
+                
+                username = ask_with_default("Enter your Kaggle Username (slug)", "username")
+                train_val_slug = ask_with_default("Enter Dataset Slug containing your Train/Val bundle", "project-data")
+                test_slug = ask_with_default("Enter Dataset Slug containing your Test bundle", "project-data")
+                script_slug = ask_with_default("Enter Dataset Slug containing your Source Code", "src-model")
+                train_val_name = ask_with_default("Enter filename of your Train/Val bundle", "kaggle_train_val.pt")
+                test_name = ask_with_default("Enter filename of your Test bundle", "kaggle_test.pt")
+                
+                do_test = questionary.confirm("Would you like to run test evaluation after training?", default=True).ask()
+                delta_choice = questionary.confirm("Use Delta Learning (Residual Correction)?", default=False).ask()
+                
+                scaling_mode = questionary.select(
+                    "Select Scaling Strategy for Kaggle Training:",
+                    choices=[
+                        questionary.Choice("Delta Scaling (Signal Amplification)", value="delta"),
+                        questionary.Choice("Standard Scaling (Independent)", value="standard"),
+                        questionary.Choice("MinMax Scaling (Bound to [0,1])", value="minmax"),
+                        questionary.Choice("None (Raw Physical Units)", value="none")
+                    ],
+                    default="delta"
+                ).ask()
+                
+                timestamp = int(time.time())
+                default_run_name = f"MLP_run_{timestamp}"
+                base_name = ask_with_default("Enter a base name for the Kaggle results", default_run_name)
+                
+                loaders_config = {"train": True, "val": True, "test": True}
+                script_content = generate_kaggle_runner(
+                    loaders_config, config, delta_choice, scaling_mode=scaling_mode,
+                    username=username, train_val_slug=train_val_slug, test_slug=test_slug,
+                    script_slug=script_slug, train_val_name=train_val_name, test_name=test_name,
+                    do_test=do_test, base_name=base_name
+                )
+                
+                os.makedirs(os.path.join("results", "kaggle_scripts"), exist_ok=True)
+                timestamp = int(time.time())
+                script_path = os.path.join("results", "kaggle_scripts", f"kaggle_train_runner_{timestamp}.py")
+                with open(script_path, 'w') as f:
+                    f.write(script_content)
+                
+                console.print(f"\n[bold green]✔ Kaggle Training Runner Script generated at:[/bold green] {script_path}")
+                return
+
+        # ==========================================
+        # TRAIN A NEW MODEL
+        # ==========================================
+        console.print("\n[bold magenta]--- New Model Training Config ---[/bold magenta]")
+        use_ready_loader = questionary.confirm("Train locally with an already ready data loader bundle (.pts)?", default=False).ask()
+        
+        loaders = {}
+        if use_ready_loader:
+            bundle_files = glob.glob(os.path.join("results", "cloud_datasets", "*.pt"))
+            if not bundle_files:
+                console.print("[yellow]No '.pt' bundles found. Falling back to manual setup.[/yellow]")
+                use_ready_loader = False
+            else:
+                chosen_bundle = questionary.select("Choose a dataset bundle:", choices=bundle_files).ask()
+                bundle = torch.load(chosen_bundle)
+                loaders.update(get_cloud_dataloaders(chosen_bundle))
+                
+                # RE-SCALING LOGIC for Bundles
+                scaling_mode = questionary.select(
+                    "Select Scaling Strategy for this bundle:",
+                    choices=[
+                        questionary.Choice("Delta Scaling (Signal Amplification)", value="delta"),
+                        questionary.Choice("Standard Scaling (Independent)", value="standard"),
+                        questionary.Choice("MinMax Scaling (Bound to [0,1])", value="minmax"),
+                        questionary.Choice("None (Raw Physical Units)", value="none"),
+                        questionary.Choice("Use Bundle's Original Scaler (if exists)", value="original")
+                    ],
+                    default="delta"
+                ).ask()
+                
+                if scaling_mode == "original":
+                    scaler = PropertyScaler.from_dict(bundle.get("metadata", {})) if "metadata" in bundle else None
+                else:
+                    scaler = None
+                    if "train" in loaders:
+                        scaler = PropertyScaler(mode=scaling_mode)
+                        # Re-fit using existing bundle tensors
+                        ds = loaders["train"].dataset
+                        scaler.fit(ds.noisy, ds.y_true)
+                        
+                loaders_config = {"test": True} if "test" in loaders else {}
+                
+        if not use_ready_loader:
+            loaders_config = interactive_setup(DATA_DIR)
+            console.print("\n[bold cyan]Loading Datasets...[/bold cyan]")
+            loaders = get_dataloaders(loaders_config)
+            
+            action_choice = questionary.select(
+                "Dataset Generation Complete! What would you like to do next?",
+                choices=["Train Locally", "Export to Cloud (.pt)", "Both", "Cancel"],
+                default="Train Locally"
+            ).ask()
+            
+            if action_choice == "Cancel":
+                return
+
+            # Selection Configuration AFTER choosing to proceed
+            delta_choice = questionary.confirm("Use Delta Learning (Residual Correction)?", default=False).ask()
+            
+            scaling_mode = questionary.select(
+                "Select Scaling Strategy:",
+                choices=[
+                    questionary.Choice("Delta Scaling (Signal Amplification)", value="delta"),
+                    questionary.Choice("Standard Scaling (Independent)", value="standard"),
+                    questionary.Choice("MinMax Scaling (Bound to [0,1])", value="minmax"),
+                    questionary.Choice("None (Raw Physical Units)", value="none")
+                ],
+                default="delta" if delta_choice else "standard"
+            ).ask()
+            
+            # FIT SCALER for context
+            scaler = None
+            if "train" in loaders:
+                scaler = loaders["train"].dataset.get_scaler(mode=scaling_mode)
+            
+            if action_choice in ["Export to Cloud (.pt)", "Both"]:
+                timestamp = int(time.time())
+                console.print(f"\n[cyan]Packaging Native PyTorch Tensors for Cloud Deployment...[/cyan]")
+                
+                train_val_loaders = {k: v for k, v in loaders.items() if k in ["train", "val"]}
+                test_loaders = {k: v for k, v in loaders.items() if k == "test"}
+                
+                if train_val_loaders:
+                    custom_train_name = questionary.text("Enter a name for the Train/Val dataset bundle:").ask()
+                    bundle_tr_name = custom_train_name if custom_train_name else f"kaggle_train_val_{timestamp}"
+                    export_path_train = os.path.join("results", "cloud_datasets", f"{bundle_tr_name}.pt")
+                    export_to_cloud_bundle(train_val_loaders, export_path_train)
+                    console.print(f"[bold green]✔ Train/Val Dataset sealed at:[/bold green] {export_path_train}")
+                    
+                if test_loaders:
+                    custom_test_name = questionary.text("Enter a name for the Test dataset bundle:").ask()
+                    bundle_te_name = custom_test_name if custom_test_name else f"kaggle_test_{timestamp}"
+                    export_path_test = os.path.join("results", "cloud_datasets", f"{bundle_te_name}.pt")
+                    export_to_cloud_bundle(test_loaders, export_path_test)
+                    console.print(f"[bold green]✔ Test Dataset sealed at:[/bold green] {export_path_test}")
+                
+                if action_choice == "Export to Cloud (.pt)":
+                    return
+
+    if delta_choice:
+        model = MLPDelta(config["input_dim"], config["hidden_dims"], config["dropout"]).to(device)
+    else:
+        model = MLP(config["input_dim"], config["hidden_dims"], config["dropout"]).to(device)
+
+    if "train" in loaders and "val" in loaders:
+        model, history = train(model, loaders, config, device, delta=delta_choice, scaler=locals().get("scaler"))
+        plot_history(history)
+        
+        delta_str = "delta" if delta_choice else "nodelta"
+        timestamp = int(time.time())
+        default_base_name = f"MLP_{delta_str}_{timestamp}"
+        custom_base_name = questionary.text(f"Enter a base name for the results (leave blank for: {default_base_name}):").ask()
+        base_name = custom_base_name if custom_base_name else default_base_name
+        
+        config["delta"] = delta_choice
+        os.makedirs(os.path.join("results", "models"), exist_ok=True)
+        os.makedirs(os.path.join("results", "histories"), exist_ok=True)
+        os.makedirs(os.path.join("results", "configs"), exist_ok=True)
+        os.makedirs(os.path.join("results", "plots"), exist_ok=True)
+        
+        torch.save(model.state_dict(), os.path.join("results", "models", f"{base_name}.pth"))
+        with open(os.path.join("results", "histories", f"{base_name}_history.json"), 'w') as f:
+            json.dump(history, f, indent=4)
+        with open(os.path.join("results", "configs", f"{base_name}_config.json"), 'w') as f:
+            json.dump(config, f, indent=4)
+            
+        plt.figure(figsize=(10,6))
+        plt.plot(history['train_loss'], label='Train Loss', color='blue')
+        plt.plot(history['val_loss'], label='Validation Loss', color='orange')
+        plt.title(f"Training Convergence - {base_name}")
+        plt.savefig(os.path.join("results", "plots", f"{base_name}_curve.png"), dpi=300)
+        plt.close()
+            
+        console.print(f"\n[bold green]✔ Results saved to results/ for:[/bold green] {base_name}\n")
+        
+    if "test" in loaders_config or "test" in loaders:
+        test_model(model, DATA_DIR, loaders_config, loaders.get("test"), device, delta_choice, base_name if "base_name" in locals() else None, scaler=locals().get("scaler"))
+
+if __name__ == "__main__":
+    main()

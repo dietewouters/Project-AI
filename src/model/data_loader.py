@@ -1,18 +1,17 @@
-# Loading, splitting, preprocessing data
-
 import scipy.sparse as sp
 import os
-from audioop import cross
 import glob
 import pandas as pd
 import numpy as np
-#from sklearn.preprocessing import StandardScaler
 import torch
 from config import config
 from torch.utils.data import Dataset, DataLoader, random_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import cross_val_predict
+from model.scaler import PropertyScaler
+
+# Unified Data Loader containing both Dynamic and Scaffold-specific datasets
+
+# PropertyScaler has been moved to model/scaler.py
 class DynamicMoleculeDataset(Dataset):
     def __init__(self, dataset_config, features_dir='data/processed_features'):
         self.mode = dataset_config.get("mode", "precomputed")
@@ -51,15 +50,17 @@ class DynamicMoleculeDataset(Dataset):
                 
             final_df = pd.concat(all_dfs, ignore_index=True)
             
+            # Shuffle BEFORE dropping duplicates to ensure balanced noise distribution
+            # This randomizes which noisy version of a molecule is kept during de-duplication
+            final_df = final_df.sample(frac=1, random_state=None).reset_index(drop=True)
+            
             print(f"  [+] Dropping cross-noise duplicates natively...")
             final_df = final_df.drop_duplicates(subset=["molecule"]).reset_index(drop=True)
             
             if total_molecules > 0 and total_molecules < len(final_df):
-                # Sample specifically down to the required explicit bound if tracking caused overfetching
+                # Sample down to the required explicit bound
                 final_df = final_df.sample(n=total_molecules, random_state=None).reset_index(drop=True)
-            else:
-                final_df = final_df.sample(frac=1).reset_index(drop=True)
-                
+            
             print(f"  [=] TOTAL Final Unique Molecules: {len(final_df)}")
             aligned_indices = final_df["original_index"].tolist()
             self.noisy = torch.tensor(final_df["input"].values, dtype=torch.float32).unsqueeze(1)
@@ -101,13 +102,30 @@ class DynamicMoleculeDataset(Dataset):
         y_true = self.y_true[idx]
         
         if self.mode == "on-the-fly":
-            # Add Gaussian noise with given standard deviation on the fly
+            # Add Fully Random (Uniform) noise on the fly: range [-noise_std, noise_std]
             clean_target = self.clean_target_for_noise[idx]
-            noisy = clean_target + torch.randn_like(clean_target) * self.noise_std
+            noise = (torch.rand_like(clean_target) - 0.5) * 2 * self.noise_std
+            noisy = clean_target + noise
         else:
             noisy = self.noisy[idx]
             
         return fp, noisy, y_true
+
+    def get_scaler(self, mode="delta"):
+        """ Returns a fitted PropertyScaler for this dataset """
+        scaler = PropertyScaler(mode=mode)
+        
+        # Determine noisy values for fitting
+        if self.noisy is not None:
+            noisy_vals = self.noisy
+        else:
+            # Handle on-the-fly mode: generate a sample of noisy values
+            print("  [Scaler] Generating on-the-fly sample for fitting...")
+            noise = torch.randn_like(self.y_true) * self.noise_std
+            noisy_vals = self.y_true + noise
+            
+        scaler.fit(noisy_vals, self.y_true)
+        return scaler
 
 
 class DynamicMoleculeDatasetKNN(DynamicMoleculeDataset):
@@ -142,25 +160,45 @@ class CloudMoleculeDataset(Dataset):
         return len(self.fp)
 
     def __getitem__(self, idx):
-        fp = self.fp[idx]
-        noisy = self.noisy[idx]
-        y_true = self.y_true[idx]
-        return fp, noisy, y_true
+        # SIMPLE LOADING: No bit-unpacking needed anymore.
+        # If the tensor is half-precision (float16), we return it as is.
+        # The model/train loop will handle casting to float32.
+        return self.fp[idx], self.noisy[idx], self.y_true[idx]
 
-def export_to_cloud_bundle(loaders, export_path):
+    def get_scaler(self, mode="delta"):
+        """ Returns a fitted PropertyScaler for this cloud dataset payload """
+        scaler = PropertyScaler(mode=mode)
+        scaler.fit(self.noisy, self.y_true)
+        return scaler
+
+def export_to_cloud_bundle(loaders, export_path, scaler=None):
     """ Extracts base PyTorch tensors from instantiated datasets and seals them in a single .pt """
     import os
     os.makedirs(os.path.dirname(export_path), exist_ok=True)
     bundle = {}
+    
+    # Use provided scaler for metadata if available
+    scaler_dict = None
+    if scaler is not None:
+        scaler_dict = scaler.to_dict()
+        bundle["metadata"] = scaler_dict
+
     for split, loader in loaders.items():
         ds = loader.dataset
-        # Regardless of mode (precomputed or on-the-fly), the dataset caches these static tensors
+        
+        # Convert fingerprints to Half-Precision (Float16)
+        # This reduces storage by 2x compared to float32 without the complexity of bit-packing
+        print(f"  [>] Converting {split} to Float16 for storage...")
+        fp_final = ds.fp.to(torch.float16)
+        
         bundle[split] = {
-            "fp": ds.fp,
-            "noisy": ds.noisy if ds.noisy is not None else ds.clean_target_for_noise, # Simplified logic if pre-generated
+            "fp": fp_final,
+            "noisy": ds.noisy if ds.noisy is not None else ds.clean_target_for_noise,
             "y_true": ds.y_true
         }
     torch.save(bundle, export_path)
+    if scaler_dict:
+        print(f"✅ Exported bundle with scaling metadata: {scaler_dict}")
 
 def get_dataloaders(loaders_config, features_dir='data/processed_features'):
     """
@@ -184,15 +222,17 @@ def get_dataloaders(loaders_config, features_dir='data/processed_features'):
 
 def get_cloud_dataloaders(bundle_path):
     """
-    Instantiates DataLoader objects directly off a pre-extracted Kaggle/Cloud .pt payload
+    Instantiates DataLoader objects directly off a pre-extracted Kaggle/Cloud .pt payload.
+    Uses mmap=True to keep RAM usage minimal even for 16GB datasets.
     """
-    bundle = torch.load(bundle_path)
+    # Use mmap=True to ensure the 16GB Float16 tensor doesn't flood RAM
+    bundle = torch.load(bundle_path, mmap=True, weights_only=False)
         
     datasets = {}
     for split, tensor_dict in bundle.items():
         if split == "metadata":
             continue
-        print(f"  [+] Unpacking Cloud payload block -> {split.upper()}")
+        print(f"  [+] Loading Cloud payload block -> {split.upper()}")
         datasets[split] = CloudMoleculeDataset(tensor_dict)
         
     loaders = {}
@@ -203,74 +243,131 @@ def get_cloud_dataloaders(bundle_path):
     return loaders
 
 def main():
-    dataset_path = 'data/groupadditivity_h298/dataset/groupadditivity_0.004.csv'
-    noisy_path = 'data/groupadditivity_h298/dataset/noise0.01/groupadditivity_0.004_noise0.01.csv'
-    indices_dir = 'data/groupadditivity_h298/indices'
-    
-    loaders = get_dataloaders(dataset_path, noisy_path, indices_dir)
-
-    for split_name, loader in loaders.items():
-        print(f"\n--- {split_name.upper()} DATASET ---")
-        
-        # Access the custom MoleculeDataset object
-        ds = loader.dataset
-        
-        print(f"Total samples: {len(ds)}")
-        
-        # Grab the first item (index 0)
-        # Based on your class, this returns: fp, noisy, y_true
-        sample_fp, sample_noisy, sample_true = ds[0]
-        
-        print(f"Fingerprint shape: {sample_fp.shape}")
-        print(f"Fingerprint (first 10 bits): {sample_fp[:10]}")
-        print(f"Noisy Input (Scaled): {sample_noisy.item():.4f}")
-        print(f"True h298: {sample_true.item():.4f}")
-        
-        # Verify the Delta math: Noisy - True = Delta
-        # (Allowing for small float precision differences)
-        calc_delta = sample_noisy.item() - sample_true.item()
-        print(f"Manual Delta Check: {calc_delta:.4f}")
+    # Example usage / Debugging entry point
+    pass
 
 if __name__ == "__main__":
     main()
 
-def count_sparse_features(features_dir='data/processed_features'):
-    # Find all .npz files in the directory
-    npz_files = sorted(glob.glob(os.path.join(features_dir, "features_chunk_*.npz")))
-    
-    if not npz_files:
-        print(f"No .npz files found in {features_dir}")
-        return
 
-    print(f"{'File Name':<30} | {'Molecules (Rows)':<15} | {'Active Features (nnz)':<20}")
-    print("-" * 75)
+class SimpleScaffoldDataset(Dataset):
+    """
+    A simplified dataset specifically for scaffold-split experiments with structural noise.
+    Directly subsets CSVs and Fingerprints by provided indices.
+    """
+    def __init__(self, target_csv_path, noisy_csv_path, indices_path, features_dir, index_offset=0):
+        print(f"  [Scaffold] Initializing... ")
+        print(f"  [Scaffold] Target: {os.path.basename(target_csv_path)}")
+        print(f"  [Scaffold] Noisy:  {os.path.basename(noisy_csv_path)}")
+        print(f"  [Scaffold] Indices: {os.path.basename(indices_path)}")
 
-    total_rows = 0
-    total_nnz = 0
-
-    for file_path in npz_files:
-        file_name = os.path.basename(file_path)
+        # 1. Load Indices (Global positions)
+        with open(indices_path, 'r') as f:
+            self.indices = [int(i) for i in f.read().split()]
         
-        # Load the sparse matrix
-        matrix = sp.load_npz(file_path)
+        # Calculate local indices for the quarterly noisy file
+        local_indices = [i - index_offset for i in self.indices]
+        print(f"  [Scaffold] Loaded {len(self.indices)} indices (Offset: {index_offset}).")
+
+        # 2. Load and Subset target CSV (Full File -> Use Global Indices)
+        t_df = pd.read_csv(target_csv_path)
+        t_df = t_df.rename(columns={"h298": "target", "smiles": "molecule"})
+        t_df_subset = t_df.iloc[self.indices].copy()
+
+        # 3. Load and Subset noisy CSV (Partial File -> Use Local Indices)
+        n_df = pd.read_csv(noisy_csv_path)
+        n_df = n_df.rename(columns={"h298": "noisy_input", "smiles": "molecule"})
+        n_df_subset = n_df.iloc[local_indices].copy()
+
+        # 4. Extract Tensors
+        self.y_true = torch.tensor(t_df_subset["target"].values, dtype=torch.float32)
+        self.noisy = torch.tensor(n_df_subset["noisy_input"].values, dtype=torch.float32).unsqueeze(1)
+        self.molecules = t_df_subset["molecule"].values
+
+        # 5. Load Fingerprints (subsetted from the global bank)
+        chunks = sorted(glob.glob(os.path.join(features_dir, "*.npz")))
+        if chunks:
+            print(f"  [Scaffold] Loading {len(chunks)} fingerprint chunks...")
+            feature_bank = sp.vstack([sp.load_npz(c) for c in chunks])
+            
+            # BIT-PACKING: Load and compress immediately to save RAM
+            fp_subset = feature_bank[self.indices].toarray().astype(np.uint8)
+            packed_fp = np.packbits(fp_subset, axis=-1)
+            self.fp = torch.from_numpy(packed_fp)
+            print(f"  [Scaffold] Packed fingerprints ready: {self.fp.shape} (uint8)")
+        else:
+            print("  [Scaffold] ⚠️ Warning: No fingerprints found in features_dir!")
+            self.fp = torch.zeros((len(self.indices), 1))
+
+    def __len__(self):
+        return len(self.molecules)
+
+    def __getitem__(self, idx):
+        # SIMPLE LOADING: Directly return the stored tensors.
+        return self.fp[idx], self.noisy[idx], self.y_true[idx]
+
+    def get_scaler(self, mode="delta"):
+        """ Fitting a PropertyScaler manually since this loader is detached from the main config """
+        # PropertyScaler is already imported at top level in this file
+        scaler = PropertyScaler(mode=mode)
+        scaler.fit(self.noisy, self.y_true)
+        return scaler
+
+def get_scaffold_dataloaders(splits_config, features_dir, batch_size=64):
+    """
+    splits_config = {
+        'train': {'target': '...', 'noisy': '...', 'indices': '...'},
+        'val':   {...},
+        'test':  {...}
+    }
+    """
+    loaders = {}
+    for split, paths in splits_config.items():
+        # Extract the start row for index offsetting
+        # We assume the last integer in the noisy filename or directory might hint at the quarter,
+        # but the safest way is to let the Stage 4 script provide it.
+        # Here we look for the quarter index in the config if provided.
+        index_offset = paths.get('index_offset', 0)
         
-        rows = matrix.shape[0]  # Number of rows
-        nnz = matrix.nnz        # Number of non-zero elements
+        dataset = SimpleScaffoldDataset(
+            target_csv_path=paths['target'],
+            noisy_csv_path=paths['noisy'],
+            indices_path=paths['indices'],
+            features_dir=features_dir,
+            index_offset=index_offset
+        )
+        loaders[split] = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=(split == 'train'),
+            num_workers=0
+        )
+    return loaders
+class ARSDataset(Dataset):
+    """
+    A specialized dataset for Adaptive Residual Scaling.
+    Handles bit-unpacking for fingerprints automatically to ensure
+    the model always receives 1024-bit float features.
+    """
+    def __init__(self, fp, noisy, y_true):
+        self.fp = fp
+        self.noisy = noisy
+        self.y_true = y_true
+
+    def __len__(self):
+        return len(self.fp)
+
+    def __getitem__(self, idx):
+        fp = self.fp[idx]
         
-        total_rows += rows
-        total_nnz += nnz
-        
-        print(f"{file_name:<30} | {rows:<15} | {nnz:<20}")
+        # Handle bit-unpacking if stored as packed uint8
+        if fp.dtype == torch.uint8:
+            # np.unpackbits is faster than manual logic
+            fp_np = fp.numpy() if not isinstance(fp, np.ndarray) else fp
+            fp_unpacked = torch.from_numpy(np.unpackbits(fp_np).astype(np.float32))
+        else:
+            fp_unpacked = fp.float()
 
-    print("-" * 75)
-    print(f"{'TOTAL':<30} | {total_rows:<15} | {total_nnz:<20}")
-
-if __name__ == "__main__":
-    # Adjust this path to where your files are actually stored
-    main()
-    #count_sparse_features('data/processed_features')
-
-
-
+        return fp_unpacked, self.noisy[idx], self.y_true[idx]
 
 

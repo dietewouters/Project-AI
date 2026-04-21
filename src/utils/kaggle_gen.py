@@ -1,5 +1,6 @@
 import os
 import json
+import pprint
 
 def generate_kaggle_bundler(loaders_config, username="username", dataset_name="project-data", script_name="src-model", train_val_name="kaggle_train_val.pt", test_name="kaggle_test.pt"):
     """
@@ -28,7 +29,7 @@ def generate_kaggle_bundler(loaders_config, username="username", dataset_name="p
                             else:
                                 block[key] = os.path.basename(p)
 
-    config_final = json.dumps(sc, indent=4)
+    config_final = pprint.pformat(sc, indent=4)
 
     template = f'''# =================================================================
 # KAGGLE DATASET BUNDLER SCRIPT
@@ -166,20 +167,15 @@ if test_loaders:      print(f" - Test:      {{TEST_BUNDLE}}")
 '''
     return template
 
-
-def generate_kaggle_runner(loaders_config, global_config, delta_choice, username="username", train_val_slug="project-data", test_slug="project-data", script_slug="src-model", train_val_name="kaggle_train_val.pt", test_name="kaggle_test.pt", do_test=True, base_name="model_run"):
+def generate_kaggle_runner(loaders_config, global_config, delta_choice, ars_choice=False, model_type="MLPDelta", scaling_mode="delta", username="username", train_val_slug="project-data", test_slug="project-data", script_slug="src-model", train_val_name="kaggle_train_val.pt", test_name="kaggle_test.pt", do_test=True, base_name="model_run", activation_type="GELU"):
     """
-    Generates a Python script for Kaggle that:
-    1. Indexes source code.
-    2. Loads pre-made .pt bundles.
-    3. Initializes the model and runs training.
-    4. Saves ALL results (model, config, history, plots) to /kaggle/working properly.
+    Generates a streamlined Python script for Kaggle training.
     """
+    import pprint
+    config_final = pprint.pformat(global_config, indent=4)
     
-    # Template for the Kaggle Training Runner
     template = f'''# =================================================================
-# KAGGLE MODEL TRAINING SCRIPT
-# Purpose: Train and evaluate the model using pre-made .pt bundles.
+# KAGGLE MODEL TRAINING SCRIPT (STREAMLINED)
 # =================================================================
 import os
 import sys
@@ -187,157 +183,223 @@ import torch
 import torch.nn as nn
 import json
 import matplotlib.pyplot as plt
+import numpy as np
 
-# --- DYNAMIC CONFIGURATION (Set by Wizard) ---
+# --- DYNAMIC CONFIGURATION ---
 KAGGLE_USERNAME = "{username}"
 TRAIN_VAL_SLUG = "{train_val_slug}"
 TEST_SLUG = "{test_slug}"
 SCRIPT_SLUG = "{script_slug}"
-
-# Bundle Filenames
 TRAIN_VAL_BUNDLE = "{train_val_name}"
 TEST_BUNDLE = "{test_name}"
-
-# Execution Settings
-DO_TEST = {do_test}
 BASE_NAME = "{base_name}"
+DELTA_CHOICE = {delta_choice}
+MODEL_TYPE = "{model_type}"
+
+SCALING_MODE = "{scaling_mode}"
 
 # Paths
-TRAIN_VAL_PATH = f"/kaggle/input/datasets/{{KAGGLE_USERNAME}}/{{TRAIN_VAL_SLUG}}/{{TRAIN_VAL_BUNDLE}}"
+TRAIN_VAL_PATH = f"/kaggle/input/datasets/{{KAGGLE_USERNAME}}/{{TRAIN_VAL_SLUG}}/results/cloud_datasets/{{TRAIN_VAL_BUNDLE}}"
 if not os.path.exists(TRAIN_VAL_PATH):
-    TRAIN_VAL_PATH = f"/kaggle/input/{{TRAIN_VAL_SLUG}}/{{TRAIN_VAL_BUNDLE}}"
+    TRAIN_VAL_PATH = f"/kaggle/input/{{TRAIN_VAL_SLUG}}/results/cloud_datasets/{{TRAIN_VAL_BUNDLE}}"
 
-TEST_PATH = f"/kaggle/input/datasets/{{KAGGLE_USERNAME}}/{{TEST_SLUG}}/{{TEST_BUNDLE}}"
+TEST_PATH = f"/kaggle/input/datasets/{{KAGGLE_USERNAME}}/{{TEST_SLUG}}/results/cloud_datasets/{{TEST_BUNDLE}}"
 if not os.path.exists(TEST_PATH):
-    TEST_PATH = f"/kaggle/input/{{TEST_SLUG}}/{{TEST_BUNDLE}}"
+    TEST_PATH = f"/kaggle/input/{{TEST_SLUG}}/results/cloud_datasets/{{TEST_BUNDLE}}"
 
 SOURCE_PATH = f"/kaggle/input/datasets/{{KAGGLE_USERNAME}}/{{SCRIPT_SLUG}}"
 if not os.path.exists(SOURCE_PATH):
     SOURCE_PATH = f"/kaggle/input/{{SCRIPT_SLUG}}"
 
-# 1. PATH INDEXING & DIAGNOSTICS
-print("\\n" + "="*50)
-print("KAGGLE DIAGNOSTICS PROBE")
-print("="*50)
-import os, sys # Re-importing inside just in case of any weird scope issues
-print("Current Working Directory: " + os.getcwd())
-print("Python sys.path: " + str(sys.path))
-if os.path.exists('/kaggle/input'):
-    print("Kaggle Inputs: " + str(os.listdir('/kaggle/input')))
+# 1. SETUP ENVIRONMENT
+if SOURCE_PATH not in sys.path: sys.path.append(SOURCE_PATH)
+# Deep search for the 'src' folder containing 'model/'
+found_src = False
+for root, dirs, files in os.walk(SOURCE_PATH):
+    if 'model' in dirs and 'config.py' in files:
+        if root not in sys.path: sys.path.insert(0, root)
+        found_src = True
+        break
+if not found_src:
+    print(f"[!] Warning: Could not find 'model' folder in {{SOURCE_PATH}}. Imports may fail.")
 
-SOURCE_ROOT = None
-TRAIN_VAL_ROOT = os.path.dirname(TRAIN_VAL_PATH)
-TEST_ROOT = os.path.dirname(TEST_PATH)
-
-print("[+] Discovering package roots...")
-for p in [SOURCE_PATH, TRAIN_VAL_ROOT, TEST_ROOT]:
-    if os.path.exists(p):
-        if p not in sys.path: sys.path.append(p)
-        # Recursive check to handle zip-nesting
-        for root_node, dirs, files in os.walk(p):
-            if 'model' in dirs and 'config.py' in files:
-                SOURCE_ROOT = root_node
-                if SOURCE_ROOT not in sys.path:
-                    sys.path.insert(0, SOURCE_ROOT)
-                print("✅ Source root discovered at: " + str(SOURCE_ROOT))
-                break
-if not SOURCE_ROOT:
-    print("⚠️ Warning: Could not find 'model/' package automatically.")
-print("="*50 + "\\n")
-
-def plot_history(history, plot_path):
-    plt.figure(figsize=(10,6))
-    plt.plot(history['train_loss'], label='Train Loss', color='blue', linewidth=2)
-    plt.plot(history['val_loss'], label='Validation Loss', color='orange', linewidth=2)
-    plt.title(f"Training Convergence - {{BASE_NAME}}")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss (MSE)")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✅ Loss curve saved to: {{plot_path}}")
-
-# 2. LOAD SOURCE & PARAMS
-from model.model import MLP, MLPDelta
-from model.train import train
-from model.data_loader import get_cloud_dataloaders
+# 2. IMPORTS
+import torch
+import torch.nn as nn
+import numpy as np
+import json
+import os
+from model.model import MLP, MLPDelta, MLPFiLM, MLPARS, DeltaGRNMLP, GRNFiLMMLP, GRNARSMLP
+from model.train import train_one_epoch
 from model.evaluate import evaluate
-from config import config # Use the config file from your source dataset
+from model.scaler import PropertyScaler
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+# --- DATA LOADING WRAPPER (Kaggle Specific) ---
+class SafeDataLoader:
+    def __init__(self, dataloader): self.dataloader = dataloader; self.dataset = dataloader.dataset
+    def __iter__(self):
+        for fp, noisy, y_true in self.dataloader:
+            if fp.dtype == torch.uint8:
+                # Bit-unpack 1024-bit fingerprints on the fly
+                fp = torch.from_numpy(np.unpackbits(fp.cpu().numpy(), axis=-1).astype(np.float32)).to(device)
+            yield fp, noisy, y_true
+    def __len__(self): return len(self.dataloader)
+
+# --- INITIALIZATION ---
+TRAIN_VAL_PATH = f"/kaggle/input/{train_val_slug}/{train_val_name}"
+print(f"[+] Loading bundle: {{TRAIN_VAL_PATH}}...")
+
+from model.data_loader import get_cloud_dataloaders
+raw_loaders = get_cloud_dataloaders(TRAIN_VAL_PATH)
+loaders = {{k: SafeDataLoader(v) for k, v in raw_loaders.items()}}
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[+] Using device: {{device}}")
-
-# Override local path with Kaggle path
-config['data_path'] = "/kaggle/input"
-delta_choice = {delta_choice}
-
-# 3. LOAD DATA BUNDLES
-print("\\n[+] Unpacking PyTorch Tensors from bundles...")
-loaders = {{}}
-
-if os.path.exists(TRAIN_VAL_PATH):
-    print(f"  [>] Loading Train/Val: {{TRAIN_VAL_PATH}}")
-    loaders.update(get_cloud_dataloaders(TRAIN_VAL_PATH))
+if MODEL_TYPE == "GRNFiLMMLP":
+    model = GRNFiLMMLP(1025, activation_type="{activation_type}")
+elif MODEL_TYPE == "GRNARSMLP":
+    model = GRNARSMLP(1025, activation_type="{activation_type}")
+elif MODEL_TYPE == "DeltaGRNMLP":
+    model = DeltaGRNMLP(1025, activation_type="{activation_type}")
+elif MODEL_TYPE == "MLPARS":
+    model = MLPARS(1025, activation_type="{activation_type}")
+elif MODEL_TYPE == "MLPFiLM":
+    model = MLPFiLM(1025, activation_type="{activation_type}")
+elif MODEL_TYPE == "MLPDelta":
+    model = MLPDelta(1025, activation_type="{activation_type}")
 else:
-    print(f"  [!] Warning: Train/Val bundle not found at {{TRAIN_VAL_PATH}}")
+    model = MLP(1025, activation_type="{activation_type}")
+model.to(device)
 
-if DO_TEST:
-    if os.path.exists(TEST_PATH):
-        print(f"  [>] Loading Test: {{TEST_PATH}}")
-        loaders.update(get_cloud_dataloaders(TEST_PATH))
-    else:
-        print(f"  [!] Warning: Test bundle not found at {{TEST_PATH}}")
+scaler = PropertyScaler(mode="{scaling_mode}")
+if 'train' in loaders:
+    scaler.fit(loaders['train'].dataset.noisy, loaders['train'].dataset.y_true)
 
-# 4. INITIALIZE MODEL
-print("\\n[+] Initializing Model...")
-input_dim = config.get("input_dim", 1025)
-hidden_dims = config.get("hidden_dims", [512, 256, 128, 64])
-dropout = config.get("dropout", 0.2)
-activation = config.get("activation_function", "GELU")
+# --- TRAINING LOOP ---
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+criterion = nn.MSELoss()
+history = {{"train_loss": [], "val_loss": []}}
 
-if delta_choice:
-    model = MLPDelta(input_dim, hidden_dims, dropout)
-    print("  [>] Architecture: MLPDelta (Residual Correction)")
-else:
-    model = MLP(input_dim, hidden_dims, dropout)
-    print("  [>] Architecture: Standard MLP")
+print(f"[+] Starting {{MODEL_TYPE}} training...")
+for epoch in range(15):
+    t_loss = train_one_epoch(model, loaders['train'], optimizer, criterion, device, delta=DELTA_CHOICE, scaler=scaler)
+    v_loss = evaluate(model, loaders['val'], criterion, device, delta=DELTA_CHOICE, scaler=scaler)
+    scheduler.step(v_loss)
+    history['train_loss'].append(t_loss); history['val_loss'].append(v_loss)
+    print(f"Epoch {{epoch+1:02d}} | Train: {{t_loss:.6f}} | Val: {{v_loss:.6f}}")
 
-# 5. EXECUTE TRAINING
-print("\\n[+] Starting Training Loop...")
-model, history = train(model, loaders, config, device, delta=delta_choice)
+# --- SAVE RESULTS ---
+res_dir = "/kaggle/working/results"
+for d in ["models", "histories"]: os.makedirs(os.path.join(res_dir, d), exist_ok=True)
+torch.save(model.state_dict(), os.path.join(res_dir, "models", f"{base_name}.pt"))
+with open(os.path.join(res_dir, "histories", f"{base_name}_history.json"), "w") as f: json.dump(history, f)
+print(f"✅ Results saved to {{res_dir}}")
+'''
+    return template
 
-# 6. FINAL EVALUATION
-if DO_TEST and 'test' in loaders:
-    print("\\n[+] Running Final Evaluation on Test Set...")
-    criterion = nn.MSELoss()
-    test_loss = evaluate(model, loaders['test'], criterion, device, delta=delta_choice)
-    print(f"  [✔] Final Test Loss: {{test_loss:.6f}}")
+def generate_kaggle_plotter(username="username"):
+    """
+    Generates a standalone Python script for Kaggle that parses history files
+    and generates custom plots based on user arguments.
+    """
+    template = f'''# =================================================================
+# KAGGLE POST-PROCESSING: PLOTTING TOOL
+# Purpose: Generate custom plots from saved training histories.
+# Usage: !python plotter.py --history results/histories/run1_history.json --metric val --name model_a_val
+# =================================================================
+import os
+import json
+import argparse
+import matplotlib.pyplot as plt
 
-# 7. SAVE COMPREHENSIVE RESULTS
-RESULTS_BASE = "/kaggle/working/results"
-models_dir = os.path.join(RESULTS_BASE, "models")
-histories_dir = os.path.join(RESULTS_BASE, "histories")
-configs_dir = os.path.join(RESULTS_BASE, "configs")
-plots_dir = os.path.join(RESULTS_BASE, "plots")
-
-for d in [models_dir, histories_dir, configs_dir, plots_dir]:
-    os.makedirs(d, exist_ok=True)
-
-model_path = os.path.join(models_dir, f"{{BASE_NAME}}.pt")
-history_path = os.path.join(histories_dir, f"{{BASE_NAME}}_history.json")
-config_path = os.path.join(configs_dir, f"{{BASE_NAME}}_config.json")
-plot_path = os.path.join(plots_dir, f"{{BASE_NAME}}_curve.png")
-
-print("\\n[+] Persisting results to /kaggle/working/results/...")
-torch.save(model.state_dict(), model_path)
-with open(history_path, 'w') as f:
-    json.dump(history, f, indent=4)
-with open(config_path, 'w') as f:
-    json.dump(config, f, indent=4)
+def plot_history(history, metric, output_path, base_name):
+    plt.figure(figsize=(10,6))
     
-plot_history(history, plot_path)
+    if metric == 'both':
+        if 'train_loss' in history:
+            plt.plot(history['train_loss'], label='Train Loss', color='#1f77b4', linewidth=2, marker='o', markersize=4, alpha=0.8)
+        if 'val_loss' in history:
+            plt.plot(history['val_loss'], label='Validation Loss', color='#ff7f0e', linewidth=2, marker='s', markersize=4, alpha=0.8)
+        if 'train_eval_loss' in history:
+            plt.plot(history['train_eval_loss'], label='Train Eval (Original Scale)', color='#2ca02c', linestyle='--', alpha=0.6)
+        title = f"Training Convergence - {{base_name}}"
+    elif metric == 'train':
+        plt.plot(history['train_loss'], label='Train Loss', color='#1f77b4', linewidth=2.5)
+        title = f"Training Loss - {{base_name}}"
+    elif metric == 'val':
+        plt.plot(history['val_loss'], label='Validation Loss', color='#ff7f0e', linewidth=2.5)
+        title = f"Validation Loss - {{base_name}}"
+    
+    plt.title(title, fontsize=14, fontweight='bold')
+    plt.xlabel("Epoch", fontsize=12)
+    plt.ylabel("Loss (MSE)", fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add info box
+    best_val = min(history['val_loss']) if 'val_loss' in history and history['val_loss'] else "N/A"
+    textstr = f"Best Val Loss: {{best_val}}" if isinstance(best_val, str) else f"Best Val Loss: {{best_val:.6f}}"
+    plt.gcf().text(0.15, 0.02, textstr, fontsize=10, bbox=dict(facecolor='white', alpha=0.5))
 
-print(f"\\n[✔] COMPLETE! All artifacts saved with base name: {{BASE_NAME}}")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Plot saved to: {{output_path}}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Kaggle Plotting Utility")
+    parser.add_argument("--history", type=str, help="Path to the history JSON file")
+    parser.add_argument("--metric", type=str, choices=['train', 'val', 'both'], default='both', help="Which metric to plot")
+    parser.add_argument("--name", type=str, default=None, help="Custom name for the plot file")
+    args = parser.parse_args()
+
+    # 1. Discovery logic
+    HISTORIES_DIR = "/kaggle/working/results/histories"
+    PLOTS_DIR = "/kaggle/working/results/plots"
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+
+    if not args.history:
+        # Auto-discover if none provided
+        if os.path.exists(HISTORIES_DIR):
+            files = [f for f in os.listdir(HISTORIES_DIR) if f.endswith(".json")]
+            if not files:
+                print(f"❌ No history files found in {{HISTORIES_DIR}}")
+                return
+            print("Available histories:")
+            for i, f in enumerate(files):
+                print(f"  [{{i}}] {{f}}")
+            choice = input("\\nSelect index to plot (or 'all'): ").strip()
+            if choice == 'all':
+                to_plot = [os.path.join(HISTORIES_DIR, f) for f in files]
+            else:
+                try:
+                    to_plot = [os.path.join(HISTORIES_DIR, files[int(choice)])]
+                except:
+                    print("Invalid choice.")
+                    return
+        else:
+            print(f"❌ Directory {{HISTORIES_DIR}} not found.")
+            return
+    else:
+        to_plot = [args.history]
+
+    # 2. Execution
+    for h_path in to_plot:
+        if not os.path.exists(h_path):
+            print(f"⚠️ File not found: {{h_path}}")
+            continue
+            
+        with open(h_path, 'r') as f:
+            history = json.load(f)
+        
+        base_name_val = os.path.basename(h_path).replace("_history.json", "").replace(".json", "")
+        out_name = args.name if args.name else f"{{base_name_val}}_{{args.metric}}_curve.png"
+        if not out_name.endswith(".png"): out_name += ".png"
+        
+        plot_path = os.path.join(PLOTS_DIR, out_name)
+        plot_history(history, args.metric, plot_path, base_name_val)
+
+if __name__ == "__main__":
+    main()
 '''
     return template

@@ -5,8 +5,8 @@ from torch.nn import ReLU, GELU, SiLU, LeakyReLU, ELU
 config = {
             # Model Parameters
             "input_dim" : 1025,
-            "hidden_dims" : [512, 256, 128, 64],
-            "dropout" : 0.2,
+            "hidden_dims" : [256, 64],
+            "dropout" : 0.4,
             "activation_function" : "GELU", 
             "delta": False,
 
@@ -15,9 +15,11 @@ config = {
             "batch_size" : 64,
             "epochs" : 20,
             "optimizer" : "adam",
-            "weight_decay" : 1e-5,
+            "weight_decay" : 1e-3,
             "patience" : 5,
             "num_workers" : 0,
+            "augment_noise": False,        # This stops the bypass
+            "base_sigma": 0.01,           # This sets the noise intensity (e.g., 0.01 = 1%)
 
             # Data Paths
             "data_path" : os.path.join(os.getcwd(), 'data', 'groupadditivity_h298')

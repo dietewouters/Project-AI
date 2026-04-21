@@ -1,81 +1,71 @@
-# Final evaluation on validation/test set
+# Final evaluation on test set
 import torch
+import numpy as np
 
 
-def compute_loss_on_original_scale(predictions, noisy, y_true, criterion, delta=False, target_scaler=None):
-    predictions = predictions.view(-1)
-    noisy = noisy.view(-1)
-    y_true = y_true.view(-1)
-
-    if delta:
-        # model predicts delta = noisy - clean
-        # => clean_pred = noisy - predicted_delta
-        clean_pred = noisy - predictions
-    else:
-        clean_pred = predictions
-
-    # unscale before computing loss
-    if target_scaler is not None:
-        clean_pred = target_scaler.inverse_transform_tensor(clean_pred)
-        y_true = target_scaler.inverse_transform_tensor(y_true)
-
-    loss = criterion(clean_pred, y_true)
-    return loss
-
-
-def evaluate(model, loader, criterion, device, delta=False, target_scaler=None) -> float:
+def evaluate(model, loader, criterion, device, delta=False, scaler=None) -> float:
+    """
+    Validation evaluation: Computes loss in scaled space (if scaler present).
+    """
     model.eval()
     total_loss = 0.0
-
     with torch.no_grad():
         for fp, noisy, y_true in loader:
-            fp = fp.to(device)
-            noisy = noisy.to(device)
-            y_true = y_true.to(device)
+            if scaler:
+                # Standardize inputs and targets together
+                noisy_proc, y = scaler.transform(noisy, y_true)
+            else:
+                noisy_proc = noisy
+                if delta:
+                    y = (noisy.view(-1) - y_true.view(-1))
+                else:
+                    y = y_true
 
-            X = torch.cat([fp, noisy], dim=1)
+            # Prepare features
+            y = y.to(device)
+            X = torch.cat([fp, noisy_proc.view(-1, 1)], dim=1).to(device).float()
             predictions = model(X)
-
-            loss = compute_loss_on_original_scale(
-                predictions=predictions,
-                noisy=noisy,
-                y_true=y_true,
-                criterion=criterion,
-                delta=delta,
-                target_scaler=target_scaler
-            )
-
-            total_loss += loss.item() * len(y_true)
+            loss = criterion(predictions.view(-1), y.view(-1))
+                
+            total_loss += loss.item() * len(fp)
 
     return total_loss / len(loader.dataset)
 
-
-def test(model, loader, criterion, device, delta=False, target_scaler=None) -> float:
+def test(model, loader, criterion, device, delta=False, scaler=None) -> float:
+    """
+    Final test evaluation: Reports loss in physical (unscaled) units.
+    """
     actual_loader = loader['test'] if isinstance(loader, dict) and 'test' in loader else loader
-
     model.eval()
     total_loss = 0.0
-
     with torch.no_grad():
         for fp, noisy, y_true in actual_loader:
-            fp = fp.to(device)
-            noisy = noisy.to(device)
-            y_true = y_true.to(device)
+            if scaler:
+                # Transform only noisy input for the model pass
+                noisy_proc = scaler.transform(noisy)
+            else:
+                noisy_proc = noisy
 
-            X = torch.cat([fp, noisy], dim=1)
+            # Prepare features
+            y_true_eval = y_true.to(device)
+            
+            X = torch.cat([fp, noisy_proc.view(-1, 1)], dim=1).to(device).float()
             predictions = model(X)
-
-            loss = compute_loss_on_original_scale(
-                predictions=predictions,
-                noisy=noisy,
-                y_true=y_true,
-                criterion=criterion,
-                delta=delta,
-                target_scaler=target_scaler
-            )
-
-            total_loss += loss.item() * len(y_true)
+            
+            if scaler:
+                # Use PropertyScaler to map prediction back to real physical units
+                final_predictions = scaler.inverse_transform(noisy, predictions.view(-1))
+                final_predictions = final_predictions.to(device)
+            else:
+                if delta:
+                    # predictions is raw delta, so True = Noisy - Delta
+                    final_predictions = noisy.to(device).view(-1) - predictions.view(-1)
+                else:
+                    final_predictions = predictions.view(-1)
+                
+            loss = criterion(final_predictions.view(-1), y_true_eval.view(-1))
+            total_loss += loss.item() * len(X)
 
     final_loss = total_loss / len(actual_loader.dataset)
-    print(f"Test Loss: {final_loss:.4f}")
+    print(f"Test Loss (Physical Units): {final_loss:.4f}")
     return final_loss

@@ -1,0 +1,94 @@
+{
+    "noise_levels": {
+        "gaussian": {
+            "0.01": {
+                "mean": 0,
+                "scale": 0.01
+            },
+            "0.02": {
+                "mean": 0,
+                "scale": 0.02
+            },
+            "0.08": {
+                "mean": 0,
+                "scale": 0.08
+            },
+            "0.2": {
+                "mean": 0,
+                "scale": 0.2
+            },
+            "0.4": {
+                "mean": 0,
+                "scale": 0.4
+            },
+            "1.0": {
+                "mean": 0,
+                "scale": 1.0
+            }
+        },
+        "cosh": {
+            "noise1_cosh": {
+                "mean": 0,
+                "loc": 1.543404638418213,
+                "scale": 4.258,
+                "distribution": "cosh(x)/scale on [-loc, loc]"
+            }
+        },
+        "uniform": {
+            "noise1_uniform": {
+                "mean": 0,
+                "low": -1.7320508075688772,
+                "high": 1.7320508075688772,
+                "std_dev": 1.0,
+                "distribution": "uniform on [-sqrt(3), sqrt(3)]"
+            }
+        },
+        "bimodal": {
+            "noise1_bimodal": {
+                "mean": 0,
+                "components": [
+                    {
+                        "type": "gaussian",
+                        "scale": 0.8660254040185549
+                    },
+                    {
+                        "type": "discrete_choice",
+                        "values": [
+                            -0.5,
+                            0.5
+                        ]
+                    }
+                ],
+                "total_std_dev": 1.0
+            }
+        },
+        "half": {
+            "noise20_half": {
+                "positive": {
+                    "type": "gaussian",
+                    "scale": 20,
+                    "mean": 0
+                },
+                "negative": {
+                    "type": "gaussian",
+                    "scale": 2,
+                    "mean": 0
+                }
+            }
+        },
+        "nitrogen": {
+            "noise20_nitrogen": {
+                "contains_nitrogen": {
+                    "type": "gaussian",
+                    "scale": 20,
+                    "mean": 0
+                },
+                "otherwise": {
+                    "type": "gaussian",
+                    "scale": 2,
+                    "mean": 0
+                }
+            }
+        }
+    }
+}
