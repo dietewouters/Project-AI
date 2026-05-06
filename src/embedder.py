@@ -202,10 +202,13 @@ def extract_embeddings(model, smiles_list: list[str], batch_size: int = 128):
     with torch.no_grad():
         for batch in loader:
             bmg = batch.bmg
+            # BatchMolGraph.to() mutates in place and returns None — call it for
+            # the side-effect, do NOT reassign.
             if hasattr(bmg, "to"):
-                bmg = bmg.to(device)
+                bmg.to(device)
             V_d = getattr(batch, "V_d", None)
             X_d = getattr(batch, "X_d", None)
+            # Tensor.to() is not in-place; reassignment is correct here.
             if V_d is not None and hasattr(V_d, "to"):
                 V_d = V_d.to(device)
             if X_d is not None and hasattr(X_d, "to"):
@@ -219,18 +222,61 @@ def extract_embeddings(model, smiles_list: list[str], batch_size: int = 128):
 # ── checkpoint helpers ────────────────────────────────────────────────────
 
 def save_model(model, path: str | Path) -> None:
+    """Save weights, plus the output-transform stats so load_model can rebuild
+    the same architecture (otherwise its mean/scale buffers would be missing)."""
+    import json
     import torch
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), str(path))
 
+    transform = getattr(getattr(model, "predictor", None), "output_transform", None)
+    if transform is None:
+        return
+    stats: dict[str, list[float]] = {}
+    for attr in ("mean", "scale"):
+        buf = getattr(transform, attr, None)
+        if buf is not None and hasattr(buf, "detach"):
+            stats[attr] = buf.detach().cpu().numpy().reshape(-1).tolist()
+    if stats:
+        with open(str(path) + ".scaler.json", "w") as f:
+            json.dump(stats, f)
+
 
 def load_model(path: str | Path, hparams: dict | None = None):
-    """Recreate the architecture, load weights, return the model in eval mode."""
+    """Recreate the architecture, load weights, return the model in eval mode.
+
+    If a sibling ``<path>.scaler.json`` exists, the FFN's UnscaleTransform is
+    rebuilt from those stats so the state dict round-trips exactly. Older
+    checkpoints (no scaler.json) fall back to ``strict=False``, which silently
+    drops the extra transform keys — safe here because we only call
+    ``model.fingerprint()`` for embedding, never the predictor."""
+    import json
+    import numpy as np
     import torch
     from chemprop.nn import BondMessagePassing, MeanAggregation, RegressionFFN
     from chemprop.models import MPNN
 
     hp = {**DEFAULT_HPARAMS, **(hparams or {})}
+
+    output_transform = None
+    scaler_path = Path(str(path) + ".scaler.json")
+    if scaler_path.exists():
+        try:
+            from chemprop.nn.transforms import UnscaleTransform
+            from sklearn.preprocessing import StandardScaler
+            with open(scaler_path) as f:
+                stats = json.load(f)
+            mean = np.asarray(stats["mean"], dtype=float).reshape(-1)
+            scale = np.asarray(stats["scale"], dtype=float).reshape(-1)
+            scaler = StandardScaler()
+            scaler.mean_ = mean
+            scaler.scale_ = scale
+            scaler.var_ = scale ** 2
+            scaler.n_features_in_ = len(mean)
+            output_transform = UnscaleTransform.from_standard_scaler(scaler)
+        except Exception:
+            output_transform = None
+
     mp = BondMessagePassing(
         d_v=72, d_e=14,
         d_h=hp["d_h"], depth=hp["depth"], dropout=hp["dropout"],
@@ -241,6 +287,7 @@ def load_model(path: str | Path, hparams: dict | None = None):
         hidden_dim=hp["ffn_hidden"],
         n_layers=hp["ffn_layers"],
         n_tasks=1,
+        output_transform=output_transform,
     )
     model = MPNN(
         message_passing=mp, agg=agg, predictor=ffn,
@@ -248,6 +295,7 @@ def load_model(path: str | Path, hparams: dict | None = None):
         warmup_epochs=hp["warmup_epochs"],
         init_lr=hp["init_lr"], max_lr=hp["max_lr"], final_lr=hp["final_lr"],
     )
-    model.load_state_dict(torch.load(str(path), map_location="cpu"))
+    state = torch.load(str(path), map_location="cpu")
+    model.load_state_dict(state, strict=False)
     model.eval()
     return model
