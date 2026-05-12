@@ -164,9 +164,12 @@ def train_embedder(
     early_stop_cb = pl.pytorch.callbacks.EarlyStopping(
         monitor="val_loss", min_delta=0.005, patience=2, mode="min",
     )
+    # RichProgressBar matches the rest of the benchmark UI and shows a
+    # clear "Epoch N/MAX  ━━━ B/TOTAL_B" line instead of Lightning's default.
+    progress_cb = pl.pytorch.callbacks.RichProgressBar(leave=True)
     trainer = pl.Trainer(
         max_epochs=epochs,
-        callbacks=[checkpoint_cb, early_stop_cb],
+        callbacks=[checkpoint_cb, early_stop_cb, progress_cb],
         default_root_dir=save_dir,
         enable_progress_bar=True,
         logger=pl.pytorch.loggers.CSVLogger(save_dir),

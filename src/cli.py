@@ -137,6 +137,30 @@ DEFAULT_STATE: dict[str, Any] = {
         "denoised_csv": None,
         "metrics":      None,
     },
+    "benchmark": {
+        "sigmas":           [1.0, 2.0, 5.0, 10.0, 20.0],
+        "rounds":           30,
+        "n_sample":         100000,
+        "n_seeds":          3,
+        "k":                10,
+        "out_dir":          str(WORKSPACE / "benchmark"),
+        "ga_test_csv":      str(DEFAULT_GA_DIR / "groupadditivity_test.csv"),
+        "ga_fit_csv":       str(DEFAULT_GA_DIR / "groupadditivity.csv"),
+        "ga_train_csv":     str(DEFAULT_GA_DIR / "groupadditivity_1.csv"),
+        "enabled_presets":  ["gaussian_sweep"],
+        # Per-preset overrides for {n_sample, rounds, n_seeds, k}. Empty
+        # means use the preset defaults (see benchmark_denoise.PRESETS).
+        "preset_overrides": {},
+        # Embedder (re)training config used at the start of every suite run.
+        # Stratified-by-h298 subsample of `ga_train_csv` (disjoint from test).
+        "train": {
+            "n_train":       100000,
+            "epochs":        30,
+            "batch_size":    128,
+            "force_retrain": False,
+        },
+        "last_run":         None,
+    },
 }
 
 
@@ -1708,8 +1732,9 @@ def menu_hpo(state: dict) -> None:
             return
 
         if idx == 0:
-            if not truth["csv"] or not Path(truth["csv"]).exists():
-                error("ground-truth CSV not configured")
+            ga_csv = truth.get("ga_csv")
+            if not ga_csv or not Path(ga_csv).exists():
+                error("group-additivity reference CSV not configured")
                 pause()
                 continue
             try:
@@ -1902,6 +1927,574 @@ def print_pipeline_help() -> None:
     )
     console.print(explanation)
 
+    math = Text.from_markup(
+        "\n[brand]Mathematics — what each step computes[/brand]\n"
+        "\n[hi]Group additivity (Step 0)[/hi]\n"
+        "  h298(mol) = Σ_i  count_i(mol) · coef_i\n"
+        "    count_i(mol) = number of times atom-environment i appears in mol\n"
+        "                   (Morgan radius-1 fingerprint, central atom + 1-hop nbrs)\n"
+        "    coef_i       = fitted constant solved once via sparse LSMR from\n"
+        "                   reference (SMILES, h298) pairs.\n"
+        "\n[hi]Embedder (Step 1)[/hi]\n"
+        "  Chemprop v2 message-passing neural network (MPNN), bond-message variant:\n"
+        "    h_v^{(0)}                       = atom features  (d_v = 72)\n"
+        "    m_{vw}^{(t+1)} = h_v^{(t)} ⊕ e_{vw}                (bond message)\n"
+        "    m_{vw}^{(t+1)} = ReLU(W · m_{vw}^{(t+1)})\n"
+        "    h_v^{(T)}      = ReLU(W_a · ( h_v^{(0)} ⊕ Σ_{w∈N(v)} m_{wv}^{(T)} ))\n"
+        "    z(mol)         = mean_v h_v^{(T)}                  (MeanAggregation)\n"
+        "  Defaults: hidden d_h = 300, depth T = 3, dropout 0, batch-norm on.\n"
+        "  Training: targets z-scored, loss = MSE on the standardised target,\n"
+        "  Adam with warmup (init 1e-4 → max 1e-3 → final 1e-4 over 2 epochs).\n"
+        "  Only the encoder is kept after training; the FFN head is discarded.\n"
+        "\n[hi]Embedding distance metric (Step 2)[/hi]\n"
+        "  d(mol_a, mol_b) = ‖ z(mol_a) − z(mol_b) ‖₂          (Euclidean L2)\n"
+        "  Implemented via scipy.spatial.cKDTree over the (n × 300) embedding\n"
+        "  matrix; the k nearest neighbours of every molecule are looked up in\n"
+        "  O(n · log n) per round.\n"
+        "\n[hi]Inverse-distance-weighted k-NN denoising (Step 3)[/hi]\n"
+        "  For each molecule v at round r and its k nearest neighbours N_k(v):\n"
+        "      w_i        = 1 / (d_i + ε)                        ε = 1e-9\n"
+        "      ŷ_v^{(r)} = Σ_{i∈N_k(v)}  w_i · y_i^{(r-1)}  /  Σ_{i∈N_k(v)} w_i\n"
+        "  The update is applied to every molecule simultaneously, then the\n"
+        "  process is repeated for r = 1..R rounds. Larger k smooths more;\n"
+        "  more rounds tighten convergence but eventually over-smooth\n"
+        "  (regression toward the local mean of the embedding cluster).\n"
+        "\n[hi]Benchmark metrics (Step 4 / menu 9)[/hi]\n"
+        "  MAE       = mean_v | ŷ_v − y_truth,v |\n"
+        "  RMSE      = √( mean_v ( ŷ_v − y_truth,v )² )\n"
+        "  R²        = 1 − Σ_v ( ŷ_v − y_truth,v )² / Σ_v ( y_truth,v − ȳ_truth )²\n"
+        "  bias      = mean_v ( ŷ_v − y_truth,v )\n"
+        "  resid σ   = std_v ( ŷ_v − y_truth,v )\n"
+        "  optimum   = argmin_r  MAE(r)        (per noise spec, after seed-averaging)\n"
+        "\n[hi]Benchmark subsampling[/hi]\n"
+        "  The benchmark draws molecules from the held-out test pool using\n"
+        "  quantile-stratified sampling on h298:\n"
+        "      bin_b   = pd.qcut(h298, q=20)            # 20 equal-frequency bins\n"
+        "      take(b) = min(n_sample/20, |bin_b|)      # roughly equal per bin\n"
+        "  This guarantees the sample spans the full enthalpy range (small\n"
+        "  alkanes ↔ large aromatics) rather than risking an isolated cluster\n"
+        "  of chemically similar molecules.\n"
+    )
+    console.print(math)
+
+
+# ── menu: run denoising-vs-rounds benchmark ───────────────────────────────
+
+_PRESET_EDITABLE_KEYS = ("n_sample", "rounds", "n_seeds", "k")
+_PRESET_KEY_HELP = {
+    "n_sample": "how many molecules to sample from the held-out test pool",
+    "rounds":   "how many k-NN denoising passes to run per noise spec",
+    "n_seeds":  "how many independent noise draws to average over (error bars)",
+    "k":        "how many nearest neighbours to average in each round",
+}
+
+_TRAIN_EDITABLE_KEYS = ("n_train", "epochs", "batch_size")
+_TRAIN_KEY_HELP = {
+    "n_train":    "how many molecules to train the embedder on (stratified by h298)",
+    "epochs":     "how many passes over the training set",
+    "batch_size": "molecules per gradient step",
+}
+
+
+def _embedder_status(state: dict) -> tuple[str, dict | None]:
+    """Return ('matches' | 'mismatch' | 'untrained', saved_config_or_none)."""
+    try:
+        import benchmark_denoise as bench_mod
+    except Exception:
+        return "untrained", None
+    embedder_dir = state["train"]["model_dir"]
+    saved = bench_mod.load_train_config(embedder_dir)
+    if saved is None:
+        return "untrained", None
+    train = state["benchmark"]["train"]
+    matches = (
+        int(saved.get("n_train", -1)) == int(train["n_train"])
+        and int(saved.get("epochs", -1)) == int(train["epochs"])
+        and int(saved.get("batch_size", -1)) == int(train["batch_size"])
+        and str(saved.get("ga_train_csv")) == str(state["benchmark"]["ga_train_csv"])
+    )
+    return ("matches" if matches else "mismatch", saved)
+
+
+def _edit_one_train_field(state: dict, key: str) -> None:
+    """Prompt for a new value for one embedder-training field."""
+    train = state["benchmark"]["train"]
+    current = int(train[key])
+    console.print()
+    console.print(
+        f"  [hi]{key}[/hi]  for embedder training\n"
+        f"  [muted]{_TRAIN_KEY_HELP[key]}[/muted]\n"
+        f"  [muted]current = {current}[/muted]"
+    )
+    try:
+        new_val = IntPrompt.ask("  new value", default=current)
+    except (KeyboardInterrupt, EOFError):
+        return
+    train[key] = int(new_val)
+    save_state(state)
+
+
+def _edit_embedder_training(state: dict) -> None:
+    """Menu to edit embedder training config + force-retrain toggle."""
+    train = state["benchmark"]["train"]
+    while True:
+        status, saved = _embedder_status(state)
+        if status == "untrained":
+            status_line = "[red]not trained yet[/red]"
+        elif status == "matches":
+            status_line = (
+                f"[green]ready[/green] — trained on "
+                f"{int(saved['n_train']):,} mols  "
+                f"({saved.get('trained_at', '—')})"
+            )
+        else:
+            status_line = (
+                f"[yellow]will retrain on next run[/yellow] — saved: "
+                f"{int(saved.get('n_train', 0)):,} mols × "
+                f"{saved.get('epochs')} epochs"
+            )
+
+        force = bool(train.get("force_retrain"))
+        items = []
+        for key in _TRAIN_EDITABLE_KEYS:
+            items.append(f"{key:<12s} = {train[key]}")
+        items += [
+            "──────────────────────────",
+            f"force retrain on next run = {'YES' if force else 'no'}",
+            "──────────────────────────",
+            "✓  Save & back",
+        ]
+
+        idx = curses_select(
+            items,
+            title="Embedder training",
+            subtitle=(
+                f"{status_line}\n"
+                "↑↓ navigate  ·  Enter to choose  ·  Esc to go back.\n"
+                "The embedder trains on a stratified subsample of\n"
+                "groupadditivity_1.csv (disjoint from the benchmark test pool)."
+            ),
+        )
+
+        if idx < 0 or idx == len(_TRAIN_EDITABLE_KEYS) + 3:
+            return
+        if idx < len(_TRAIN_EDITABLE_KEYS):
+            _edit_one_train_field(state, _TRAIN_EDITABLE_KEYS[idx])
+            continue
+        # separator
+        if idx == len(_TRAIN_EDITABLE_KEYS):
+            continue
+        # force-retrain toggle
+        if idx == len(_TRAIN_EDITABLE_KEYS) + 1:
+            train["force_retrain"] = not force
+            save_state(state)
+            continue
+        # separator before save
+        if idx == len(_TRAIN_EDITABLE_KEYS) + 2:
+            continue
+
+
+def _effective_preset(presets: dict, overrides: dict, name: str) -> dict:
+    base = dict(presets[name])
+    for key in _PRESET_EDITABLE_KEYS:
+        if name in overrides and key in overrides[name]:
+            base[key] = overrides[name][key]
+    return base
+
+
+def _fmt_int(n: int) -> str:
+    """Friendly integer formatting (10000 → 10k, 100000 → 100k, …)."""
+    if n >= 1_000_000 and n % 1_000_000 == 0:
+        return f"{n // 1_000_000}M"
+    if n >= 1000 and n % 1000 == 0:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+def _edit_one_field(state: dict, presets: dict, name: str, key: str) -> None:
+    """Prompt for one new value for one preset/key. Empty input keeps current."""
+    bench = state["benchmark"]
+    overrides = bench["preset_overrides"]
+    eff = _effective_preset(presets, overrides, name)
+    current = int(eff[key])
+    default_val = int(presets[name][key])
+
+    console.print()
+    console.print(
+        f"  [hi]{key}[/hi]  for [accent]{presets[name]['label']}[/accent]\n"
+        f"  [muted]{_PRESET_KEY_HELP[key]}[/muted]\n"
+        f"  [muted]preset default = {default_val}   "
+        f"current = {current}[/muted]"
+    )
+    try:
+        new_val = IntPrompt.ask("  new value", default=current)
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if new_val == default_val:
+        if name in overrides:
+            overrides[name].pop(key, None)
+            if not overrides[name]:
+                overrides.pop(name, None)
+    else:
+        overrides.setdefault(name, {})[key] = int(new_val)
+    save_state(state)
+
+
+def _edit_preset_fields(state: dict, presets: dict, name: str) -> None:
+    """Pick a field to edit until the user chooses 'Save and back'."""
+    bench = state["benchmark"]
+    overrides = bench["preset_overrides"]
+
+    while True:
+        eff = _effective_preset(presets, overrides, name)
+        spec_count = len(presets[name]["noise_specs"])
+        items = []
+        for key in _PRESET_EDITABLE_KEYS:
+            is_edited = key in overrides.get(name, {})
+            tag = "  (edited)" if is_edited else ""
+            items.append(f"{key:<10s} = {eff[key]}{tag}")
+        items += [
+            "──────────────────────────",
+            "✓  Save & back",
+            "↺  Reset this preset to defaults",
+        ]
+
+        idx = curses_select(
+            items,
+            title=f"Edit: {presets[name]['label']}",
+            subtitle=(
+                f"This preset runs {spec_count} noise spec(s).\n"
+                "↑↓ to navigate  ·  Enter to choose  ·  Esc to go back."
+            ),
+        )
+        # Esc/cancel → save & back
+        if idx < 0 or idx == len(_PRESET_EDITABLE_KEYS) + 1:
+            return
+        if idx < len(_PRESET_EDITABLE_KEYS):
+            _edit_one_field(state, presets, name, _PRESET_EDITABLE_KEYS[idx])
+            continue
+        # separator (idx == len(_PRESET_EDITABLE_KEYS)) — ignore
+        if idx == len(_PRESET_EDITABLE_KEYS):
+            continue
+        # Reset
+        if idx == len(_PRESET_EDITABLE_KEYS) + 2:
+            overrides.pop(name, None)
+            save_state(state)
+            success(f"reverted {presets[name]['label']} to defaults")
+            return
+
+
+def _pick_preset_to_edit(state: dict, presets: dict) -> None:
+    """Choose a preset, then open its editor."""
+    overrides = state["benchmark"]["preset_overrides"]
+    names = list(presets.keys())
+    items = []
+    for n in names:
+        eff = _effective_preset(presets, overrides, n)
+        tag = "  [yellow](edited)[/yellow]" if n in overrides else ""
+        # Rich markup is stripped by curses_select, so use plain text here.
+        plain_tag = "  (edited)" if n in overrides else ""
+        items.append(
+            f"{presets[n]['label']}{plain_tag}   "
+            f"[n={_fmt_int(eff['n_sample'])}  rounds={eff['rounds']}  "
+            f"seeds={eff['n_seeds']}  k={eff['k']}]"
+        )
+    items.append("← Back")
+
+    idx = curses_select(
+        items,
+        title="Which preset do you want to edit?",
+        subtitle="Pick a preset to change its n_sample / rounds / n_seeds / k.",
+    )
+    if idx < 0 or idx == len(names):
+        return
+    _edit_preset_fields(state, presets, names[idx])
+
+
+def _toggle_preset_selection(state: dict) -> tuple[list[str], dict[str, dict]] | None:
+    """Arrow-key menu: each preset is a toggleable row; actions below the list.
+
+    Selecting a preset row toggles it on/off and re-shows the menu. Selecting
+    'Run selected' returns the chosen presets + overrides. Returns None on
+    cancel/Esc.
+    """
+    try:
+        import benchmark_denoise as bench_mod
+    except Exception as e:
+        error(f"failed to import benchmark_denoise: {e}")
+        return None
+
+    presets = bench_mod.PRESETS
+    bench = state["benchmark"]
+    overrides: dict[str, dict] = bench.setdefault("preset_overrides", {})
+    enabled = set(bench.get("enabled_presets") or ["gaussian_sweep"])
+    enabled &= set(presets.keys())
+
+    names = list(presets.keys())
+    SEP = "──────────────────────────────────────"
+    while True:
+        train = bench["train"]
+        status, _ = _embedder_status(state)
+        status_short = {
+            "matches":   "ready",
+            "mismatch":  "will retrain",
+            "untrained": "untrained",
+        }[status]
+        force = " · FORCE RETRAIN" if train.get("force_retrain") else ""
+
+        items: list[str] = [
+            f"⚙  Embedder training   "
+            f"[n_train={_fmt_int(train['n_train'])}  "
+            f"epochs={train['epochs']}  batch={train['batch_size']}]   "
+            f"({status_short}{force})",
+            SEP,
+        ]
+        # Preset rows
+        preset_start = len(items)
+        for name in names:
+            cfg = presets[name]
+            eff = _effective_preset(presets, overrides, name)
+            mark = "[x]" if name in enabled else "[ ]"
+            tag = "  (edited)" if name in overrides else ""
+            items.append(
+                f"{mark}  {cfg['label']}{tag}   "
+                f"[n={_fmt_int(eff['n_sample'])}  rounds={eff['rounds']}  "
+                f"seeds={eff['n_seeds']}  k={eff['k']}]"
+            )
+        items += [
+            SEP,
+            "▶  Run selected presets",
+            "✎  Edit preset values…",
+            "●  Enable all",
+            "○  Disable all",
+            "✗  Cancel",
+        ]
+
+        n_enabled = len(enabled)
+        idx = curses_select(
+            items,
+            title=f"Preset selection  ({n_enabled} selected)",
+            subtitle=(
+                "↑↓ navigate  ·  Enter to choose  ·  Esc to cancel.\n"
+                "First row: change embedder training config (n_train / epochs / batch).\n"
+                "Preset rows: Enter to toggle ON/OFF.  Edit values via the ✎ action."
+            ),
+        )
+
+        if idx < 0:
+            return None
+
+        # Embedder training row
+        if idx == 0:
+            _edit_embedder_training(state)
+            continue
+
+        # Separator
+        if idx == 1:
+            continue
+
+        # Preset rows
+        if preset_start <= idx < preset_start + len(names):
+            tgt = names[idx - preset_start]
+            if tgt in enabled:
+                enabled.discard(tgt)
+            else:
+                enabled.add(tgt)
+            continue
+
+        # Separator before actions
+        if idx == preset_start + len(names):
+            continue
+
+        action_idx = idx - preset_start - len(names) - 1
+        if action_idx == 0:                       # Run
+            if not enabled:
+                error("nothing selected — toggle at least one preset first")
+                pause()
+                continue
+            ordered = [n for n in names if n in enabled]
+            bench["enabled_presets"] = ordered
+            save_state(state)
+            return ordered, copy.deepcopy(overrides)
+        if action_idx == 1:                       # Edit
+            _pick_preset_to_edit(state, presets)
+            continue
+        if action_idx == 2:                       # Enable all
+            enabled = set(names); continue
+        if action_idx == 3:                       # Disable all
+            enabled = set(); continue
+        if action_idx == 4:                       # Cancel
+            return None
+
+
+def _run_preset_suite(state: dict) -> None:
+    section("Run preset benchmark suite")
+    console.print(
+        "  [muted]Step 1: (re)train the embedder on a stratified subsample of the[/muted]\n"
+        "  [muted]GA training pool (configurable size).[/muted]\n"
+        "  [muted]Step 2: for each selected preset, inject noise on top of GA-computed[/muted]\n"
+        "  [muted]truth (held-out molecules disjoint from training), run iterative k-NN[/muted]\n"
+        "  [muted]denoising, save per-round metrics and thesis-quality plots.[/muted]\n"
+    )
+
+    trn = state["train"]
+    selection = _toggle_preset_selection(state)
+    if not selection:
+        info("cancelled")
+        return
+    selected, overrides = selection
+
+    try:
+        import benchmark_denoise as bench_mod
+    except Exception as e:
+        error(f"failed to import benchmark_denoise: {e}")
+        return
+
+    bench = state["benchmark"]
+    train_cfg = {
+        "n_train":    int(bench["train"]["n_train"]),
+        "epochs":     int(bench["train"]["epochs"]),
+        "batch_size": int(bench["train"]["batch_size"]),
+    }
+    force_retrain = bool(bench["train"].get("force_retrain", False))
+
+    console.print()
+    info(f"running {len(selected)} preset(s): {', '.join(selected)}")
+    info(
+        f"embedder training: n_train={train_cfg['n_train']:,}  "
+        f"epochs={train_cfg['epochs']}  batch={train_cfg['batch_size']}"
+        f"{'  (force retrain)' if force_retrain else ''}"
+    )
+    try:
+        summaries = bench_mod.run_suite(
+            selected,
+            overrides=overrides,
+            train_config=train_cfg,
+            force_retrain=force_retrain,
+            ga_train_csv=bench["ga_train_csv"],
+            ga_test_csv=bench["ga_test_csv"],
+            ga_fit_csv=bench["ga_fit_csv"],
+            embedder_dir=trn["model_dir"],
+            seed=trn.get("seed", 42),
+            out_dir=bench["out_dir"],
+            batch_size=trn.get("batch_size", 128),
+        )
+    except KeyboardInterrupt:
+        warn("suite cancelled by user (Ctrl-C); returning to menu")
+        return
+    except Exception as e:
+        error(f"suite failed: {e}")
+        return
+
+    # The suite already (re)trained the embedder; mark it trained in state.
+    trn["trained"] = True
+    # Auto-clear force_retrain so the next run reuses unless toggled again.
+    bench["train"]["force_retrain"] = False
+
+    bench["last_run"] = summaries[-1]["run_dir"] if summaries else None
+    save_state(state)
+    success(f"suite finished — {len(summaries)} preset(s) completed")
+    for s in summaries:
+        info(f"  {s['preset']:<16s} → {s['run_dir']}")
+
+
+def _run_manual_benchmark(state: dict) -> None:
+    section("Manual benchmark (custom Gaussian sweep)")
+    console.print(
+        "  [muted]Fully manual: pick sigmas, rounds, k, n_sample, n_seeds. Useful[/muted]\n"
+        "  [muted]when you want a specific configuration that no preset covers.[/muted]\n"
+    )
+
+    trn = state["train"]
+    if not trn.get("trained"):
+        error("Embedder is not trained. Train it first (menu option 4).")
+        return
+
+    bench = state["benchmark"]
+
+    sigmas_str = ", ".join(f"{s:g}" for s in bench["sigmas"])
+    info(f"sigmas        = [{sigmas_str}]")
+    info(f"rounds        = {bench['rounds']}")
+    info(f"k             = {bench['k']}")
+    info(f"n_sample      = {bench['n_sample']}")
+    info(f"n_seeds       = {bench['n_seeds']}")
+    info(f"out_dir       = {bench['out_dir']}")
+    info(f"GA test CSV   = {bench['ga_test_csv']}")
+    console.print()
+    if not Confirm.ask(
+        "  [muted]Run with these settings? Pick \"no\" to override.[/muted]",
+        default=True,
+    ):
+        bench["rounds"] = IntPrompt.ask("  rounds", default=int(bench["rounds"]))
+        bench["k"] = IntPrompt.ask("  k", default=int(bench["k"]))
+        bench["n_sample"] = IntPrompt.ask("  n_sample", default=int(bench["n_sample"]))
+        bench["n_seeds"] = IntPrompt.ask("  n_seeds", default=int(bench["n_seeds"]))
+        raw = Prompt.ask(
+            "  sigmas (space-separated floats)",
+            default=" ".join(f"{s:g}" for s in bench["sigmas"]),
+        )
+        try:
+            bench["sigmas"] = [float(x) for x in raw.split() if x.strip()]
+        except ValueError:
+            error("could not parse sigmas — keeping previous values")
+        save_state(state)
+
+    try:
+        import benchmark_denoise as bench_mod
+    except Exception as e:
+        error(f"failed to import benchmark_denoise: {e}")
+        return
+
+    try:
+        summary = bench_mod.run_benchmark(
+            ga_test_csv=bench["ga_test_csv"],
+            ga_fit_csv=bench["ga_fit_csv"],
+            embedder_dir=trn["model_dir"],
+            sigmas=bench["sigmas"],
+            rounds=bench["rounds"],
+            k=bench["k"],
+            n_sample=bench["n_sample"],
+            n_seeds=bench["n_seeds"],
+            seed=trn.get("seed", 42),
+            out_dir=bench["out_dir"],
+            batch_size=trn.get("batch_size", 128),
+            make_plots_flag=True,
+            run_label="manual",
+        )
+    except Exception as e:
+        error(f"benchmark failed: {e}")
+        return
+
+    bench["last_run"] = summary["run_dir"]
+    save_state(state)
+    success(f"benchmark finished → {summary['run_dir']}")
+    info(f"plots: {summary['plots_dir']}")
+
+
+def run_benchmark_menu(state: dict) -> None:
+    section("Benchmark denoising rounds (GA truth)")
+    opts = [
+        "Run preset suite (selectable from a list)",
+        "Manual benchmark (custom Gaussian sweep)",
+        "Back",
+    ]
+    idx = curses_select(
+        opts,
+        title="Benchmark menu",
+        subtitle=(
+            "All benchmarks evaluate on molecules HELD-OUT from embedder training,\n"
+            "using GA-computed h298 as ground truth, then comparing the denoised\n"
+            "values after R rounds against that truth."
+        ),
+    )
+    if idx < 0 or idx == 2:
+        return
+    if idx == 0:
+        _run_preset_suite(state)
+    elif idx == 1:
+        _run_manual_benchmark(state)
+
 
 # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -1915,8 +2508,9 @@ MAIN_OPTS = [
     "Visualise denoising (scatter + stats)",       # 6
     "Settings (epochs, batch, seed, k, rounds)",   # 7
     "Hyperparameter tuning (advanced)",            # 8
-    "Reset workspace",                             # 9
-    "Quit",                                        # 10
+    "Benchmark denoising rounds (GA truth)",       # 9
+    "Reset workspace",                             # 10
+    "Quit",                                        # 11
 ]
 
 
@@ -1934,7 +2528,7 @@ def main():
             ),
         )
 
-        if idx < 0 or idx == 10:
+        if idx < 0 or idx == 11:
             console.print("\n  [muted]Goodbye![/muted]\n")
             break
 
@@ -1962,6 +2556,9 @@ def main():
         elif idx == 8:
             menu_hpo(state)
         elif idx == 9:
+            run_benchmark_menu(state)
+            pause()
+        elif idx == 10:
             state = reset_workspace(state)
             save_state(state)
             pause()

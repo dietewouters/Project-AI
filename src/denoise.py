@@ -67,6 +67,7 @@ def iterative_denoise(
     rounds: int,
     log_dir: Path | str | None = None,
     smiles: list[str] | None = None,
+    progress_cb=None,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     """Apply ``idw_knn_denoise_round`` ``rounds`` times.
 
@@ -100,10 +101,13 @@ def iterative_denoise(
                 cols = {"smiles": smiles, **cols}
             pd.DataFrame(cols).to_csv(log_path / f"round_{r}.csv", index=False)
 
-        rprint(
-            f"  [muted]round {r}/{rounds}  "
-            f"mean={current.mean():.4f}  std={current.std():.4f}[/muted]"
-        )
+        if progress_cb is not None:
+            progress_cb(r, rounds, float(current.mean()), float(current.std()))
+        else:
+            rprint(
+                f"  [muted]round {r}/{rounds}  "
+                f"mean={current.mean():.4f}  std={current.std():.4f}[/muted]"
+            )
 
     return current, history
 
