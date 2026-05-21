@@ -149,6 +149,39 @@ PRESETS: dict[str, dict[str, Any]] = {
             ]
         ),
     },
+    "report_gaussian": {
+        "label": "Report: high-σ Gaussian sweep",
+        "description": "8k mols, 10 rounds, 1 seed — σ ∈ {20, 40, 60, 80, 120, 160}.",
+        "n_sample": 8000,
+        "rounds": 10,
+        "n_seeds": 1,
+        "k": 10,
+        "noise_specs": [
+            {"label": f"normal σ={s:g}", "type": "normal", "scale": float(s),
+             "layers": _gaussian_layers(s)}
+            for s in [20, 40, 60, 80, 120, 160]
+        ],
+    },
+    "report_types": {
+        "label": "Report: distribution comparison @ scale=40",
+        "description": "8k mols, 10 rounds, 1 seed — five noise distributions all at scale=40.",
+        "n_sample": 8000,
+        "rounds": 10,
+        "n_seeds": 1,
+        "k": 10,
+        "noise_specs": [
+            {"label": "normal s=40", "type": "normal", "scale": 40.0,
+             "layers": [{"type": "normal", "scale": 40.0}]},
+            {"label": "uniform s=40", "type": "uniform", "scale": 40.0,
+             "layers": [{"type": "uniform", "scale": 40.0}]},
+            {"label": "cosh s=40", "type": "cosh", "scale": 40.0,
+             "layers": [{"type": "cosh", "scale": 40.0}]},
+            {"label": "bimodal s=40", "type": "bimodal", "scale": 40.0,
+             "layers": [{"type": "bimodal", "scale": 40.0}]},
+            {"label": "outlier 10% σ=40", "type": "outlier", "scale": 40.0,
+             "layers": [{"type": "outlier", "scale": 40.0, "fraction": 0.1}]},
+        ],
+    },
 }
 
 
@@ -709,8 +742,8 @@ def plot_mae_vs_round(results: pd.DataFrame, labels: list[str], out_dir: Path) -
     ax.set_xlabel("Denoising round")
     ax.set_ylabel("MAE vs. ground truth  (kcal/mol)")
     _bold_title(ax, "MAE vs. denoising round")
-    ax.legend(title="Noise spec", frameon=False, loc="upper right", fontsize=9)
-    ax.grid(alpha=0.3)
+    ax.legend(title="Noise spec", frameon=False, fontsize=9,
+              loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
     _save(fig, out_dir, "01_mae_vs_round")
 
 
@@ -731,8 +764,8 @@ def plot_r2_vs_round(results: pd.DataFrame, labels: list[str], out_dir: Path) ->
     ax.set_xlabel("Denoising round")
     ax.set_ylabel("R² vs. ground truth")
     _bold_title(ax, "R² vs. denoising round")
-    ax.legend(title="Noise spec", frameon=False, loc="lower right", fontsize=9)
-    ax.grid(alpha=0.3)
+    ax.legend(title="Noise spec", frameon=False, fontsize=9,
+              loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
     _save(fig, out_dir, "02_r2_vs_round")
 
 
@@ -765,12 +798,14 @@ def plot_bias_variance(results: pd.DataFrame, labels: list[str], out_dir: Path) 
         ax2.tick_params(axis="y", labelcolor="#2c3e50")
         ax.set_xlabel("Round")
         _bold_title(ax, label, size=11)
-        ax.grid(alpha=0.3)
         if ax is flat[0]:
             lns = ln1 + ln2
-            ax.legend(lns, [l.get_label() for l in lns],
-                      frameon=False, loc="upper right", fontsize=8)
+            legend_handles = lns
+            legend_labels = [l.get_label() for l in lns]
 
+    fig.legend(legend_handles, legend_labels,
+               frameon=False, fontsize=9, ncol=2,
+               loc="lower center", bbox_to_anchor=(0.5, -0.02))
     fig.suptitle("Bias–variance trade-off across denoising rounds",
                  fontweight="bold", fontsize=14, y=1.01)
     _save(fig, out_dir, "03_bias_variance")
@@ -806,7 +841,6 @@ def plot_residual_violins(
     ax.set_xlabel("Denoising round")
     ax.set_ylabel("Residual: ŷ − y_truth  (kcal/mol)")
     _bold_title(ax, f"Residual distribution across rounds  ({label})")
-    ax.grid(alpha=0.3, axis="y")
     _save(fig, out_dir, "04_residual_violins")
 
 
@@ -846,7 +880,6 @@ def plot_truth_vs_pred_facets(
                        edgecolors="none")
             ax.set_xlim(lim_lo, lim_hi)
             ax.set_ylim(lim_lo, lim_hi)
-            ax.grid(alpha=0.2)
             if i == 0:
                 titles = {
                     "round_0": "Round 0 (noisy)",
@@ -891,7 +924,6 @@ def plot_optimal_round_table(results: pd.DataFrame, labels: list[str], out_dir: 
     ax2.tick_params(axis="y", labelcolor=color2)
 
     _bold_title(ax1, "Optimal round and MAE per noise spec")
-    ax1.grid(alpha=0.3, axis="y")
     _save(fig, out_dir, "06_optimal_round_per_spec")
 
 
@@ -909,9 +941,388 @@ def plot_convergence_step(results: pd.DataFrame, labels: list[str], out_dir: Pat
     ax.set_xlabel("Denoising round")
     ax.set_ylabel("Mean |y_r − y_{r−1}|  (kcal/mol, log scale)")
     _bold_title(ax, "Per-round movement (convergence vs. over-smoothing)")
-    ax.legend(title="Noise spec", frameon=False, loc="upper right", fontsize=9)
-    ax.grid(alpha=0.3, which="both")
+    ax.legend(title="Noise spec", frameon=False, fontsize=9,
+              loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
     _save(fig, out_dir, "07_convergence_step")
+
+
+def _pca_2d(z: np.ndarray, max_points: int = 8000, seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project z to 2D via PCA. Returns (coords_2d, sample_idx, explained_var_ratio).
+
+    Subsamples to ``max_points`` rows for plotting; the PCA itself is fit on
+    the subsample (fine for visualization, much faster on big z).
+    """
+    from sklearn.decomposition import PCA
+
+    n = z.shape[0]
+    if n > max_points:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(n, size=max_points, replace=False)
+        idx.sort()
+    else:
+        idx = np.arange(n)
+
+    pca = PCA(n_components=2, random_state=seed)
+    coords = pca.fit_transform(z[idx])
+    return coords, idx, pca.explained_variance_ratio_
+
+
+def plot_pca_latent(
+    z: np.ndarray,
+    y_truth: np.ndarray,
+    out_dir: Path,
+    seed: int = 0,
+) -> None:
+    """2D PCA scatter of the embedder's latent space, colored by ground-truth h298."""
+    coords, idx, evr = _pca_2d(z, seed=seed)
+    y_sub = np.asarray(y_truth, dtype=float)[idx]
+
+    fig, ax = plt.subplots(figsize=(7.6, 6.0))
+    sc = ax.scatter(
+        coords[:, 0], coords[:, 1],
+        c=y_sub, cmap="viridis", s=6, alpha=0.7, edgecolors="none",
+    )
+    cb = fig.colorbar(sc, ax=ax, pad=0.02)
+    cb.set_label("y_truth  (kcal/mol)")
+    ax.set_xlabel(f"PC1  ({evr[0] * 100:.1f}% var)")
+    ax.set_ylabel(f"PC2  ({evr[1] * 100:.1f}% var)")
+    _bold_title(ax, "Embedder latent space  (2D PCA, colored by truth)")
+    _save(fig, out_dir, "08_pca_latent")
+
+
+def _pick_trail_molecules(
+    y_truth: np.ndarray, y_noisy: np.ndarray, n: int = 6, seed: int = 0,
+) -> np.ndarray:
+    """Pick ``n`` molecules spanning the y_truth range, preferring ones with
+    non-trivial initial noise so the trail is visible."""
+    rng = np.random.default_rng(seed)
+    y_truth = np.asarray(y_truth, dtype=float)
+    y_noisy = np.asarray(y_noisy, dtype=float)
+    noise_mag = np.abs(y_noisy - y_truth)
+    # Drop the tails where points are too sparse / extreme for clean labels.
+    lo, hi = np.quantile(y_truth, [0.02, 0.98])
+    eligible = np.where((y_truth >= lo) & (y_truth <= hi))[0]
+    if len(eligible) < n:
+        eligible = np.arange(len(y_truth))
+    # Bin by truth quantile, pick the noisiest in each bin.
+    qs = np.quantile(y_truth[eligible], np.linspace(0, 1, n + 1))
+    picks: list[int] = []
+    for i in range(n):
+        in_bin = eligible[
+            (y_truth[eligible] >= qs[i]) & (y_truth[eligible] <= qs[i + 1])
+        ]
+        if len(in_bin) == 0:
+            continue
+        # Among bin members, take one of the top-noise candidates (stochastic so
+        # different seeds give different examples).
+        order = np.argsort(noise_mag[in_bin])[::-1]
+        top = in_bin[order[: min(20, len(in_bin))]]
+        picks.append(int(rng.choice(top)))
+    return np.array(picks, dtype=int)
+
+
+def plot_denoise_trails_pca(
+    z: np.ndarray,
+    history_by_label: dict[str, np.ndarray],
+    y_truth: np.ndarray,
+    labels: list[str],
+    out_dir: Path,
+    n_examples: int = 6,
+    seed: int = 0,
+) -> None:
+    """PCA scatter with 6 highlighted molecules; each molecule has an inset
+    sparkline showing its y_pred trajectory across denoising rounds against
+    the truth target.
+
+    Uses the middle noise spec (matches the convention used by the violin/
+    facets plots) for the trajectories.
+    """
+    from matplotlib.patches import FancyBboxPatch
+    from matplotlib.transforms import blended_transform_factory
+
+    label = labels[len(labels) // 2]
+    history = history_by_label[label]  # (R+1, N) — row 0 = y_noisy
+    R = history.shape[0] - 1
+    y_noisy = history[0]
+    y_truth = np.asarray(y_truth, dtype=float)
+
+    coords, idx, evr = _pca_2d(z, seed=seed)
+    y_sub = y_truth[idx]
+
+    picks = _pick_trail_molecules(y_truth, y_noisy, n=n_examples, seed=seed)
+    # Need each pick's coords; refit PCA only on the same sample so the picks
+    # share the projection. Reuse the projection by transforming the picks
+    # explicitly: re-run PCA on full sample-or-pick union for coords.
+    from sklearn.decomposition import PCA
+
+    union_idx = np.unique(np.concatenate([idx, picks]))
+    pca = PCA(n_components=2, random_state=seed).fit(z[union_idx])
+    coords = pca.transform(z[idx])
+    pick_coords = pca.transform(z[picks])
+    evr = pca.explained_variance_ratio_
+
+    fig = plt.figure(figsize=(11.5, 7.5))
+    ax = fig.add_axes([0.07, 0.08, 0.62, 0.86])
+
+    # Background PCA scatter (faint, colored by truth).
+    sc = ax.scatter(
+        coords[:, 0], coords[:, 1],
+        c=y_sub, cmap="viridis", s=5, alpha=0.35, edgecolors="none",
+    )
+    cb = fig.colorbar(sc, ax=ax, pad=0.02, shrink=0.85)
+    cb.set_label("y_truth  (kcal/mol)")
+    ax.set_xlabel(f"PC1  ({evr[0] * 100:.1f}% var)")
+    ax.set_ylabel(f"PC2  ({evr[1] * 100:.1f}% var)")
+    _bold_title(ax, f"Denoising trails in latent space  ({label})")
+
+    # Highlight the chosen molecules.
+    tab = matplotlib.colormaps["tab10"]
+    pick_colors = [tab(i % 10) for i in range(len(picks))]
+    ax.scatter(
+        pick_coords[:, 0], pick_coords[:, 1],
+        s=140, facecolors="none", edgecolors=pick_colors, linewidths=2.4, zorder=5,
+    )
+
+    # Sparkline column on the right.
+    n_pick = len(picks)
+    spark_left = 0.78
+    spark_width = 0.18
+    top, bot = 0.94, 0.06
+    gap = 0.015
+    h = (top - bot - (n_pick - 1) * gap) / n_pick
+    rounds_x = np.arange(R + 1)
+
+    # Order picks top-to-bottom by PC2 so the sparkline column roughly mirrors
+    # vertical position in the PCA scatter — easier to trace lines visually.
+    order = np.argsort(-pick_coords[:, 1])
+    for rank, k in enumerate(order):
+        mol_idx = int(picks[k])
+        col = pick_colors[k]
+        y_trail = history[:, mol_idx]
+        y_true = float(y_truth[mol_idx])
+
+        y_lo = float(min(y_trail.min(), y_true))
+        y_hi = float(max(y_trail.max(), y_true))
+        pad = max(0.05 * (y_hi - y_lo), 0.5)
+        y_lo -= pad
+        y_hi += pad
+
+        bottom = top - h - rank * (h + gap)
+        sa = fig.add_axes([spark_left, bottom, spark_width, h])
+        sa.plot(rounds_x, y_trail, "-o", color=col, ms=3, linewidth=1.5)
+        sa.axhline(y_true, color=col, linestyle="--", linewidth=1.0, alpha=0.7)
+        sa.scatter([0], [y_trail[0]], s=40, facecolors="white",
+                   edgecolors=col, linewidths=1.5, zorder=4)
+        sa.set_xlim(-0.5, R + 0.5)
+        sa.set_ylim(y_lo, y_hi)
+        sa.tick_params(axis="both", labelsize=7, length=2, pad=1)
+        sa.set_yticks([y_true])
+        sa.set_yticklabels([f"{y_true:.1f}"], fontsize=7, color=col)
+        if rank == n_pick - 1:
+            sa.set_xlabel("round", fontsize=8)
+        else:
+            sa.set_xticklabels([])
+        for sp in sa.spines.values():
+            sp.set_alpha(0.3)
+        sa.set_facecolor((1, 1, 1, 0.7))
+
+        # Connector from the PCA marker to the sparkline panel.
+        x_axes, y_axes = ax.transData.transform(pick_coords[k])
+        inv = fig.transFigure.inverted()
+        x_fig, y_fig = inv.transform((x_axes, y_axes))
+        fig.add_artist(
+            plt.Line2D(
+                [x_fig, spark_left],
+                [y_fig, bottom + h / 2],
+                transform=fig.transFigure,
+                color=col, linewidth=0.9, alpha=0.5, linestyle=":",
+            )
+        )
+
+    # Mini legend explaining the sparkline glyphs.
+    legend_ax = fig.add_axes([spark_left, 0.0, spark_width, 0.05])
+    legend_ax.axis("off")
+    legend_ax.text(
+        0.0, 0.5,
+        "○ y_noisy   •—• per-round ŷ   --- truth",
+        fontsize=7.5, va="center", color="#333",
+    )
+
+    fig.savefig(out_dir / "09_denoise_trails_pca.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(out_dir / "09_denoise_trails_pca.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_mae_improvement_vs_spec(
+    results: pd.DataFrame,
+    labels: list[str],
+    out_dir: Path,
+) -> None:
+    """Bar chart of MAE(best round) − MAE(round 0) per noise spec.
+
+    Negative bars (green) mean the denoiser improved on the noisy baseline;
+    positive bars (red) mean denoising made things worse. This is the headline
+    "where does the denoiser actually help?" plot.
+    """
+    table = _optimal_round_table(results)
+    table = table.set_index("noise_label").loc[labels].reset_index()
+    delta = (table["mae_at_optimum"] - table["mae_at_round_0"]).to_numpy()
+    rounds = table["optimal_round"].to_numpy()
+    mae0 = table["mae_at_round_0"].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.2))
+    colors = ["#2ca02c" if d < 0 else "#d62728" for d in delta]
+    bars = ax.bar(range(len(labels)), delta, color=colors, edgecolor="black", linewidth=0.5)
+    ax.axhline(0, color="black", linewidth=0.8)
+
+    for i, (bar, d, r, m0) in enumerate(zip(bars, delta, rounds, mae0)):
+        h = bar.get_height()
+        va = "bottom" if h >= 0 else "top"
+        offset = 0.02 * (abs(delta).max() + 1e-6) * (1 if h >= 0 else -1)
+        ax.text(bar.get_x() + bar.get_width() / 2, h + offset,
+                f"r*={r}\nΔ={d:+.2f}\n(was {m0:.2f})",
+                ha="center", va=va, fontsize=8)
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9)
+    ax.set_ylabel("MAE(best round) − MAE(round 0)  (kcal/mol)")
+    _bold_title(ax, "Denoiser improvement per noise spec")
+    pad = 0.25 * (abs(delta).max() + 1e-6)
+    ax.set_ylim(min(delta.min(), 0) - pad, max(delta.max(), 0) + 1.5 * pad)
+    _save(fig, out_dir, "10_mae_improvement_vs_spec")
+
+
+def _train_som(
+    z: np.ndarray,
+    grid: tuple[int, int] = (10, 10),
+    epochs: int = 30,
+    sample_cap: int = 2000,
+    seed: int = 0,
+) -> np.ndarray:
+    """Tiny numpy SOM. Returns weight tensor (H, W, D).
+
+    Trains on a subsample for speed; mapping (BMU lookup) is done over the full
+    dataset separately.
+    """
+    rng = np.random.default_rng(seed)
+    H, W = grid
+    D = int(z.shape[1])
+    z = np.asarray(z, dtype=float)
+    n_train = min(sample_cap, len(z))
+    train_idx = rng.choice(len(z), n_train, replace=False)
+    z_train = z[train_idx]
+
+    init_idx = rng.choice(n_train, H * W, replace=True)
+    weights = z_train[init_idx].reshape(H, W, D).copy()
+
+    coords = np.stack(
+        np.meshgrid(np.arange(W), np.arange(H), indexing="xy"), axis=-1,
+    ).astype(float)  # (H, W, 2): last dim is (col, row)
+
+    sigma0 = max(H, W) / 2.0
+    lr0 = 0.5
+    n_iter = epochs * n_train
+    t = 0
+    for _ in range(epochs):
+        perm = rng.permutation(n_train)
+        for i in perm:
+            x = z_train[i]
+            diff = weights - x  # (H, W, D)
+            d2 = np.einsum("hwd,hwd->hw", diff, diff)
+            bmu = np.unravel_index(int(np.argmin(d2)), (H, W))
+            frac = t / max(n_iter - 1, 1)
+            sigma = max(sigma0 * np.exp(-frac * 3.0), 0.5)
+            lr = lr0 * np.exp(-frac * 3.0)
+            dy = coords[..., 1] - bmu[0]
+            dx = coords[..., 0] - bmu[1]
+            nbr = np.exp(-(dy * dy + dx * dx) / (2.0 * sigma * sigma))
+            weights -= lr * nbr[..., None] * diff
+            t += 1
+    return weights
+
+
+def _som_bmus(z: np.ndarray, weights: np.ndarray, batch: int = 512) -> np.ndarray:
+    """Return flat BMU index in [0, H*W) for each row of z."""
+    H, W, D = weights.shape
+    flat_w = weights.reshape(-1, D)
+    bmus = np.empty(len(z), dtype=np.int64)
+    for s in range(0, len(z), batch):
+        e = min(s + batch, len(z))
+        d2 = ((z[s:e, None, :] - flat_w[None, :, :]) ** 2).sum(axis=2)
+        bmus[s:e] = d2.argmin(axis=1)
+    return bmus
+
+
+def _cell_mean(values: np.ndarray, bmus: np.ndarray, n_cells: int) -> np.ndarray:
+    """Mean of values within each SOM cell. NaN where the cell is empty."""
+    sums = np.zeros(n_cells, dtype=float)
+    counts = np.zeros(n_cells, dtype=np.int64)
+    np.add.at(sums, bmus, values)
+    np.add.at(counts, bmus, 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.where(counts > 0, sums / np.maximum(counts, 1), np.nan)
+    return out
+
+
+def plot_som_trails(
+    z: np.ndarray,
+    history_by_label: dict[str, np.ndarray],
+    y_truth: np.ndarray,
+    results: pd.DataFrame,
+    labels: list[str],
+    out_dir: Path,
+    grid: tuple[int, int] = (10, 10),
+    seed: int = 0,
+) -> None:
+    """Side-by-side SOM heatmaps for the middle noise spec:
+    truth | noisy (round 0) | denoised (best round). All share one colorbar.
+
+    The visual claim: if the denoiser works, the rightmost panel should look
+    more like the leftmost (truth) than the middle one (noisy).
+    """
+    label = labels[len(labels) // 2]
+    history = history_by_label[label]  # (R+1, N), row 0 = y_noisy
+    table = _optimal_round_table(results)
+    row = table[table["noise_label"] == label]
+    best_r = int(row["optimal_round"].iloc[0]) if not row.empty else 0
+    if best_r == 0:
+        best_r = int(history.shape[0] - 1)
+
+    weights = _train_som(z, grid=grid, seed=seed)
+    H, W = grid
+    bmus = _som_bmus(z, weights)
+    n_cells = H * W
+
+    truth_cell = _cell_mean(y_truth.astype(float), bmus, n_cells).reshape(H, W)
+    noisy_cell = _cell_mean(history[0].astype(float), bmus, n_cells).reshape(H, W)
+    best_cell = _cell_mean(history[best_r].astype(float), bmus, n_cells).reshape(H, W)
+
+    stacked = np.stack([truth_cell, noisy_cell, best_cell])
+    finite = stacked[np.isfinite(stacked)]
+    vmin = float(np.nanpercentile(finite, 2)) if finite.size else 0.0
+    vmax = float(np.nanpercentile(finite, 98)) if finite.size else 1.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.6), constrained_layout=True)
+    titles = [
+        "Ground truth h298",
+        f"Noisy y (round 0) — {label}",
+        f"Denoised ŷ (round {best_r})",
+    ]
+    for ax, panel, title in zip(axes, [truth_cell, noisy_cell, best_cell], titles):
+        im = ax.imshow(panel, origin="lower", cmap="viridis",
+                       vmin=vmin, vmax=vmax, aspect="equal")
+        _bold_title(ax, title, size=11)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlabel("SOM grid")
+
+    cbar = fig.colorbar(im, ax=axes, shrink=0.85, location="right", pad=0.02)
+    cbar.set_label("cell-mean value  (kcal/mol)")
+    fig.suptitle("SOM topology view: does denoising recover the truth landscape?",
+                 fontweight="bold", fontsize=13)
+
+    fig.savefig(out_dir / "11_som_trails.pdf", dpi=300, bbox_inches="tight")
+    fig.savefig(out_dir / "11_som_trails.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 def make_plots(
@@ -920,6 +1331,8 @@ def make_plots(
     y_truth: np.ndarray,
     labels: list[str],
     out_dir: Path,
+    z: np.ndarray | None = None,
+    seed: int = 0,
 ) -> None:
     plot_mae_vs_round(results, labels, out_dir)
     plot_r2_vs_round(results, labels, out_dir)
@@ -928,6 +1341,11 @@ def make_plots(
     plot_truth_vs_pred_facets(history_by_label, y_truth, results, labels, out_dir)
     plot_optimal_round_table(results, labels, out_dir)
     plot_convergence_step(results, labels, out_dir)
+    plot_mae_improvement_vs_spec(results, labels, out_dir)
+    if z is not None:
+        plot_pca_latent(z, y_truth, out_dir, seed=seed)
+        plot_denoise_trails_pca(z, history_by_label, y_truth, labels, out_dir, seed=seed)
+        plot_som_trails(z, history_by_label, y_truth, results, labels, out_dir, seed=seed)
 
 
 # ── orchestrator ──────────────────────────────────────────────────────────
@@ -1141,7 +1559,8 @@ def run_benchmark(
 
         if make_plots_flag:
             ui.status(preset_name, "[yellow]writing plots[/yellow]", mols=len(smiles))
-            make_plots(results, history_by_label, y_truth, labels, plots_dir)
+            make_plots(results, history_by_label, y_truth, labels, plots_dir,
+                       z=z, seed=seed)
 
         # compute best across all specs in this preset
         opt = _optimal_round_table(results)
